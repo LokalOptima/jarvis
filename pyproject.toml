@@ -1,0 +1,16 @@
+[project]
+name = "soundtools"
+version = "0.1.0"
+description = "Audio tools including wake word detection"
+requires-python = ">=3.10"
+dependencies = [
+    "openwakeword",
+    "onnxruntime>=1.10.0,<2",
+    "pyaudio",
+    "numpy",
+]
+
+[tool.uv]
+override-dependencies = [
+    "tflite-runtime ; python_version > '99'",
+]
