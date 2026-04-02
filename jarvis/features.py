@@ -1,6 +1,6 @@
-"""Extract Whisper Tiny encoder features from audio files.
+"""Extract Whisper Tiny encoder features from audio.
 
-Uses openai-whisper Python for training-time feature extraction.
+Uses openai-whisper Python for feature extraction at enrollment time.
 The C++ runtime uses whisper.cpp for the same computation.
 """
 
@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import whisper
+
+from jarvis import RATE
 
 
 @functools.cache
@@ -44,46 +46,25 @@ def _load_encoder():
     return encoder
 
 
-def extract_features(audio_path: str | Path) -> np.ndarray:
-    """Extract encoder features from a WAV file.
+def extract_features(audio: np.ndarray | str | Path) -> np.ndarray:
+    """Extract encoder features from audio.
 
     Args:
-        audio_path: Path to 16kHz mono WAV file.
+        audio: float32/int16 numpy array (mono 16kHz), or path to WAV file.
 
     Returns:
         Features array of shape [T, 384] where T depends on audio length.
-        For 1.5s audio: T ≈ 75 frames (20ms per frame).
     """
-    encoder = _load_encoder()
-    audio = whisper.load_audio(str(audio_path))
-    mel = whisper.log_mel_spectrogram(audio, n_mels=80)
-    mel = mel.unsqueeze(0)  # [1, 80, mel_frames]
+    if isinstance(audio, (str, Path)):
+        audio = whisper.load_audio(str(audio))
 
-    with torch.no_grad():
-        features = encoder(mel)  # [1, T, 384]
-
-    return features.squeeze(0).numpy()  # [T, 384]
-
-
-def extract_features_from_audio(audio: np.ndarray, sr: int = 16000) -> np.ndarray:
-    """Extract encoder features from a raw audio array.
-
-    Args:
-        audio: float32 or int16 numpy array, mono.
-        sr: Sample rate (must be 16000).
-
-    Returns:
-        Features array of shape [T, 384].
-    """
-    if sr != 16000:
-        raise ValueError(f"Expected 16kHz audio, got {sr}Hz")
-
-    if audio.dtype == np.int16:
-        audio = audio.astype(np.float32) / 32768.0
+    if isinstance(audio, np.ndarray):
+        if audio.dtype == np.int16:
+            audio = audio.astype(np.float32) / 32768.0
+        audio = torch.from_numpy(audio)
 
     encoder = _load_encoder()
-    mel = whisper.log_mel_spectrogram(torch.from_numpy(audio), n_mels=80)
-    mel = mel.unsqueeze(0)
+    mel = whisper.log_mel_spectrogram(audio, n_mels=80).unsqueeze(0)
 
     with torch.no_grad():
         features = encoder(mel)

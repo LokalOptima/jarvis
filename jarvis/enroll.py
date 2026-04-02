@@ -6,16 +6,13 @@ Step 1 — Record and extract clips:
     uv run python -m jarvis.enroll                      # live mic
     uv run python -m jarvis.enroll recording.wav         # from file
 
-    Saves to data/enrollment/recording.wav and data/enrollment/clips/
-
 Step 2 — Build templates from clips:
 
     uv run python -m jarvis.enroll --build
 
-    Reads data/enrollment/clips/*.wav, extracts Whisper features,
-    saves models/templates.bin
+    Reads data/clips/*.wav, extracts Whisper features, saves models/templates.bin
 
-You can delete bad clips from data/enrollment/clips/ between steps.
+You can delete bad clips from data/clips/ between steps.
 """
 
 import argparse
@@ -30,12 +27,12 @@ from pathlib import Path
 import numpy as np
 import whisper as whisper_asr
 
-from jarvis.features import extract_features_from_audio
+from jarvis import RATE, DATA_DIR, CLIPS_DIR, MODELS_DIR, MAX_TEMPLATE_FRAMES
+from jarvis.features import extract_features
 
-RATE = 16000
-MODELS_DIR = Path(__file__).parent.parent / "models"
-DATA_DIR = Path(__file__).parent.parent / "data"
-CLIPS_DIR = DATA_DIR / "clips"
+CLIP_PAD_SEC = 0.3   # padding around detected wake word boundaries
+MIN_CLIP_SEC = 0.4   # minimum clip length to keep
+SILENCE_MARGIN = int(RATE * 0.05)  # 50ms margin when trimming silence
 
 
 def find_wake_words(
@@ -67,8 +64,8 @@ def find_wake_words(
     return detections
 
 
-def trim_silence(audio: np.ndarray, margin: int = 800) -> np.ndarray:
-    """Trim leading/trailing silence, keeping a small margin (default 50ms)."""
+def trim_silence(audio: np.ndarray, margin: int = SILENCE_MARGIN) -> np.ndarray:
+    """Trim leading/trailing silence, keeping a small margin."""
     energy = np.abs(audio).astype(np.float32)
     win = int(RATE * 0.03)  # 30ms smoothing window
     if len(energy) <= win:
@@ -89,10 +86,10 @@ def extract_clips_from_audio(
     """Extract int16 audio clips around each detection, trimmed."""
     clips = []
     for start, end in detections:
-        s = max(0, int((start - 0.3) * RATE))
-        e = min(len(audio), int((end + 0.3) * RATE))
+        s = max(0, int((start - CLIP_PAD_SEC) * RATE))
+        e = min(len(audio), int((end + CLIP_PAD_SEC) * RATE))
         clip = trim_silence(audio[s:e])
-        if len(clip) >= int(0.4 * RATE):
+        if len(clip) >= int(MIN_CLIP_SEC * RATE):
             clips.append(clip)
     return clips
 
@@ -111,7 +108,6 @@ def next_clip_index() -> int:
     existing = sorted(CLIPS_DIR.glob("clip_*.wav"))
     if not existing:
         return 0
-    # Parse highest index and add 1
     last = existing[-1].stem  # "clip_0023"
     return int(last.split("_")[1]) + 1
 
@@ -121,9 +117,8 @@ def save_clips(clips: list[np.ndarray], full_audio: np.ndarray | None) -> list[P
     CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 
     if full_audio is not None and len(full_audio) > 0:
-        rec_path = DATA_DIR / "recording.wav"
-        save_wav(rec_path, full_audio)
-        print(f"  Recording: {rec_path} ({len(full_audio)/RATE:.1f}s)")
+        save_wav(DATA_DIR / "recording.wav", full_audio)
+        print(f"  Recording: {DATA_DIR / 'recording.wav'} ({len(full_audio)/RATE:.1f}s)")
 
     idx = next_clip_index()
     new_paths = []
@@ -152,9 +147,14 @@ def build_templates():
     for i, wav_path in enumerate(wav_files):
         with wave.open(str(wav_path), "rb") as wf:
             audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
-        audio_f32 = audio.astype(np.float32) / 32768.0
-        features = extract_features_from_audio(audio_f32)  # [T, 384]
-        templates.append(features[:100])
+        features = extract_features(audio)  # [T, 384]
+        features = features[:MAX_TEMPLATE_FRAMES]
+
+        # L2-normalize each frame so C++ can skip template norm computation
+        norms = np.linalg.norm(features, axis=1, keepdims=True)
+        features = features / np.maximum(norms, 1e-10)
+
+        templates.append(features)
         if (i + 1) % 5 == 0 or i == 0 or i == len(wav_files) - 1:
             print(f"  [{i + 1}/{len(wav_files)}] {wav_path.name} ({features.shape[0]} frames)")
 
@@ -169,7 +169,7 @@ def build_templates():
             f.write(feat.astype(np.float32).tobytes())
 
     total_frames = sum(t.shape[0] for t in templates)
-    print(f"\n  {len(templates)} templates, {total_frames} total frames (384-dim)")
+    print(f"\n  {len(templates)} templates, {total_frames} total frames (384-dim, L2-normalized)")
     print(f"  {bin_path} ({bin_path.stat().st_size} bytes)")
 
 
@@ -202,7 +202,7 @@ def live_enroll(wake_words: list[str], device: int | None = None):
 
     stream = sd.InputStream(
         samplerate=RATE, channels=1, dtype="int16",
-        device=device, callback=audio_callback, blocksize=1600,
+        device=device, callback=audio_callback, blocksize=int(RATE * 0.1),
     )
     stream.start()
 
@@ -220,14 +220,10 @@ def live_enroll(wake_words: list[str], device: int | None = None):
             all_recorded.append(new_audio)
             audio_buffer = np.concatenate([audio_buffer[-overlap_samples:], new_audio])
 
-            # Live feedback only
+            # Live feedback: write temp WAV for Whisper
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp_path = tmp.name
-                with wave.open(tmp_path, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(RATE)
-                    wf.writeframes(audio_buffer.tobytes())
+                save_wav(Path(tmp_path), audio_buffer)
 
             detections = find_wake_words(tmp_path, labeler, wake_words)
             Path(tmp_path).unlink()
@@ -252,7 +248,6 @@ def live_enroll(wake_words: list[str], device: int | None = None):
 
     # Final detection on complete audio
     rec_path = DATA_DIR / "recording.wav"
-    rec_path.parent.mkdir(parents=True, exist_ok=True)
     save_wav(rec_path, full_audio)
 
     detections = find_wake_words(str(rec_path), labeler, wake_words)
@@ -265,7 +260,7 @@ def live_enroll(wake_words: list[str], device: int | None = None):
         sys.exit(1)
 
     clips = extract_clips_from_audio(full_audio, detections)
-    save_clips(clips, full_audio)
+    save_clips(clips, None)  # recording already saved above
     print(f"\nRun 'python -m jarvis.enroll --build' to generate templates.")
 
 

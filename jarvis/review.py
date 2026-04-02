@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """Web UI to review and manage enrolled clips.
 
-    uv run python -m jarvis.review                # show all clips
-    uv run python -m jarvis.review --only clip_0019.wav clip_0020.wav  # show specific clips
+    uv run python -m jarvis.review
 
 Opens a browser with audio players for each clip. Delete bad ones, then
 run 'python -m jarvis.enroll --build' to regenerate templates.
 """
 
-import argparse
 import json
 import os
+import wave
 import webbrowser
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-CLIPS_DIR = Path(__file__).parent.parent / "data" / "clips"
+from jarvis import CLIPS_DIR
+
 PORT = 8457
 
 HTML = """<!DOCTYPE html>
@@ -119,7 +118,6 @@ class Handler(SimpleHTTPRequestHandler):
             clips = []
             if CLIPS_DIR.exists():
                 for f in sorted(CLIPS_DIR.glob("*.wav")):
-                    import wave
                     with wave.open(str(f), "rb") as wf:
                         dur = round(wf.getnframes() / wf.getframerate(), 1)
                     mtime = f.stat().st_mtime
@@ -163,13 +161,13 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
-    if not CLIPS_DIR.exists() or not list(CLIPS_DIR.glob("*.wav")):
+    clips = list(CLIPS_DIR.glob("*.wav")) if CLIPS_DIR.exists() else []
+    if not clips:
         print(f"No clips in {CLIPS_DIR}/")
         print("Run 'python -m jarvis.enroll' first.")
         return
 
-    n = len(list(CLIPS_DIR.glob("*.wav")))
-    print(f"{n} clips in {CLIPS_DIR}/")
+    print(f"{len(clips)} clips in {CLIPS_DIR}/")
     print(f"http://localhost:{PORT}")
 
     webbrowser.open(f"http://localhost:{PORT}")
