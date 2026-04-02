@@ -8,7 +8,6 @@ run 'python -m jarvis.enroll --build' to regenerate templates.
 """
 
 import json
-import os
 import wave
 import webbrowser
 from http.server import HTTPServer, SimpleHTTPRequestHandler

@@ -112,13 +112,9 @@ def next_clip_index() -> int:
     return int(last.split("_")[1]) + 1
 
 
-def save_clips(clips: list[np.ndarray], full_audio: np.ndarray | None) -> list[Path]:
-    """Save recording and extracted clips. Returns paths of new clips."""
+def save_clips(clips: list[np.ndarray]) -> list[Path]:
+    """Save extracted clips. Returns paths of new clips."""
     CLIPS_DIR.mkdir(parents=True, exist_ok=True)
-
-    if full_audio is not None and len(full_audio) > 0:
-        save_wav(DATA_DIR / "recording.wav", full_audio)
-        print(f"  Recording: {DATA_DIR / 'recording.wav'} ({len(full_audio)/RATE:.1f}s)")
 
     idx = next_clip_index()
     new_paths = []
@@ -260,7 +256,7 @@ def live_enroll(wake_words: list[str], device: int | None = None):
         sys.exit(1)
 
     clips = extract_clips_from_audio(full_audio, detections)
-    save_clips(clips, None)  # recording already saved above
+    save_clips(clips)
     print(f"\nRun 'python -m jarvis.enroll --build' to generate templates.")
 
 
@@ -293,7 +289,7 @@ def file_enroll(audio_files: list[str], wake_words: list[str]):
         print("\nNo wake words found.")
         sys.exit(1)
 
-    save_clips(all_clips, None)
+    save_clips(all_clips)
     print(f"\nRun 'python -m jarvis.enroll --build' to generate templates.")
 
 

@@ -90,30 +90,36 @@ struct Templates {
         return true;
     }
 
-    // Cosine similarity between input vector and a pre-normalized template vector.
-    // Only computes the input norm (template norm = 1).
-    static float cosine_sim_prenorm(const float *a, const float *b_unit) {
-        float dot = 0, na = 0;
-        for (int i = 0; i < WHISPER_DIM; i++) {
-            dot += a[i] * b_unit[i];
-            na  += a[i] * a[i];
+    // Pre-compute inverse norms for input frames (call once per cycle).
+    static void compute_inv_norms(const float *input, int n_frames, std::vector<float> &inv_norms) {
+        inv_norms.resize(n_frames);
+        for (int i = 0; i < n_frames; i++) {
+            float na = 0;
+            const float *a = input + i * WHISPER_DIM;
+            for (int k = 0; k < WHISPER_DIM; k++) na += a[k] * a[k];
+            inv_norms[i] = na > 0 ? 1.0f / std::sqrt(na) : 0;
         }
-        return na > 0 ? dot / std::sqrt(na) : 0;
+    }
+
+    // Dot product with pre-normalized template vector, scaled by pre-computed input inv norm.
+    static float cosine_dot(const float *a, const float *b_unit, float inv_norm_a) {
+        float dot = 0;
+        for (int i = 0; i < WHISPER_DIM; i++) dot += a[i] * b_unit[i];
+        return dot * inv_norm_a;
     }
 
     // Subsequence DTW: find the best-matching region within the input for the template.
     // The template must be fully matched, but the match can start/end anywhere in input.
     // Uses two-row sliding window instead of full matrix.
-    // Returns normalized cost (lower = better match).
     static float subdtw(const float *input, int n_input,
                         const Template &tmpl,
+                        const std::vector<float> &inv_norms,
                         std::vector<float> &prev_row,
                         std::vector<float> &curr_row) {
         int n_tmpl = tmpl.n_frames;
         prev_row.resize(n_tmpl + 1);
         curr_row.resize(n_tmpl + 1);
 
-        // First column = 0: match can start at any input frame
         std::fill(prev_row.begin(), prev_row.end(), 1e30f);
         prev_row[0] = 0.0f;
 
@@ -122,7 +128,7 @@ struct Templates {
         for (int i = 1; i <= n_input; i++) {
             curr_row[0] = 0.0f;
             for (int j = 1; j <= n_tmpl; j++) {
-                float c = 1.0f - cosine_sim_prenorm(input + (i - 1) * WHISPER_DIM, tmpl.frame(j - 1));
+                float c = 1.0f - cosine_dot(input + (i - 1) * WHISPER_DIM, tmpl.frame(j - 1), inv_norms[i - 1]);
                 float prev = prev_row[j - 1];
                 if (prev_row[j] < prev) prev = prev_row[j];
                 if (curr_row[j - 1] < prev) prev = curr_row[j - 1];
@@ -137,10 +143,12 @@ struct Templates {
 
     // Best match across all templates. Returns similarity (1 - normalized_dtw_cost).
     float match(const float *input, int n_frames,
+                std::vector<float> &inv_norms,
                 std::vector<float> &row_a, std::vector<float> &row_b) const {
+        compute_inv_norms(input, n_frames, inv_norms);
         float best_sim = -1.0f;
         for (const auto &tmpl : items) {
-            float cost = subdtw(input, n_frames, tmpl, row_a, row_b);
+            float cost = subdtw(input, n_frames, tmpl, inv_norms, row_a, row_b);
             float sim = 1.0f - cost;
             if (sim > best_sim) best_sim = sim;
         }
@@ -206,6 +214,7 @@ int main(int argc, char **argv) {
     const int max_encoder_frames = (buffer_samples / MEL_HOP + 1) / CONV_STRIDE + 1;
     const int max_encoder_floats = max_encoder_frames * WHISPER_DIM;
     std::vector<float> encoder_output(max_encoder_floats);
+    std::vector<float> inv_norms;             // pre-computed input frame inverse norms
     std::vector<float> dtw_row_a, dtw_row_b;  // reusable DTW row buffers
     std::vector<float> pcm_buffer;
     pcm_buffer.reserve(buffer_samples);
@@ -252,7 +261,7 @@ int main(int argc, char **argv) {
         int n_enc_frames = n_floats / WHISPER_DIM;
 
         // DTW match against templates
-        float score = templates.match(encoder_output.data(), n_enc_frames, dtw_row_a, dtw_row_b);
+        float score = templates.match(encoder_output.data(), n_enc_frames, inv_norms, dtw_row_a, dtw_row_b);
         auto t3 = std::chrono::steady_clock::now();
 
         if (debug) {
