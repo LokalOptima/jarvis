@@ -12,6 +12,8 @@
 #include <whisper.h>
 #include <audio_async.hpp>
 
+#include <SDL.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -34,6 +36,106 @@
 #define MEL_HOP           160    // Mel spectrogram hop length in samples
 #define CONV_STRIDE       2      // Whisper encoder conv2 stride
 #define DEFAULT_THRESHOLD 0.80f  // DTW similarity threshold
+
+// ---- Optional SDL2 GUI ----
+
+struct Gui {
+    SDL_Window   *window   = nullptr;
+    SDL_Renderer *renderer = nullptr;
+    int flash = 0;
+
+    bool init() {
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
+            std::cerr << "SDL video init failed: " << SDL_GetError() << std::endl;
+            return false;
+        }
+        window = SDL_CreateWindow("Jarvis - Wake Word",
+                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                  500, 100,
+                                  SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+        if (!window) {
+            std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
+            return false;
+        }
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        if (!renderer) {
+            // Fallback to software renderer
+            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+        }
+        if (!renderer) {
+            std::cerr << "SDL_CreateRenderer failed: " << SDL_GetError() << std::endl;
+            return false;
+        }
+        // Initial paint so the window appears immediately
+        SDL_SetRenderDrawColor(renderer, 28, 28, 28, 255);
+        SDL_RenderClear(renderer);
+        SDL_RenderPresent(renderer);
+        SDL_PumpEvents();
+        return true;
+    }
+
+    // Returns true if the user requested quit (window close or 'q')
+    bool poll() {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) return true;
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_q) return true;
+        }
+        return false;
+    }
+
+    void render(float score, float threshold, bool detected) {
+        if (!renderer) return;
+        if (detected) flash = 12;
+
+        int w, h;
+        SDL_GetWindowSize(window, &w, &h);
+
+        const int pad   = 16;
+        const int bar_h = h / 3;
+        const int bar_y = (h - bar_h) / 2;
+        const int bar_w = w - 2 * pad;
+
+        // Background: flash green on detection, dark otherwise
+        if (flash > 0) {
+            uint8_t v = (uint8_t)(60 + flash * 16);
+            SDL_SetRenderDrawColor(renderer, 20, v, 20, 255);
+            flash--;
+        } else {
+            SDL_SetRenderDrawColor(renderer, 28, 28, 28, 255);
+        }
+        SDL_RenderClear(renderer);
+
+        // Track (full-width dark bar)
+        SDL_SetRenderDrawColor(renderer, 55, 55, 55, 255);
+        SDL_Rect track = {pad, bar_y, bar_w, bar_h};
+        SDL_RenderFillRect(renderer, &track);
+
+        // Score fill: green → yellow → red as score approaches/exceeds threshold
+        float t = std::min(score / (threshold > 0 ? threshold : 1.0f), 1.0f);
+        uint8_t r = (uint8_t)(std::min(255.0f, 510.0f * t));
+        uint8_t g = (uint8_t)(std::min(255.0f, 510.0f * (1.0f - t)));
+        SDL_SetRenderDrawColor(renderer, r, g, 40, 255);
+        int fill_w = (int)(score * bar_w);
+        if (fill_w > 0) {
+            SDL_Rect fill = {pad, bar_y, std::min(fill_w, bar_w), bar_h};
+            SDL_RenderFillRect(renderer, &fill);
+        }
+
+        // Threshold marker: vertical yellow line
+        int th_x = pad + (int)(threshold * bar_w);
+        SDL_SetRenderDrawColor(renderer, 255, 220, 0, 255);
+        SDL_RenderDrawLine(renderer, th_x, bar_y - 5, th_x, bar_y + bar_h + 5);
+
+        SDL_RenderPresent(renderer);
+        SDL_PumpEvents();
+    }
+
+    ~Gui() {
+        if (renderer) SDL_DestroyRenderer(renderer);
+        if (window)   SDL_DestroyWindow(window);
+    }
+};
 
 // ---- Signal handling ----
 
@@ -163,7 +265,8 @@ static void print_usage(const char *prog) {
               << "  -m <path>   Whisper model (default: models/ggml-tiny.bin)\n"
               << "  -e <path>   Enrolled templates (default: models/templates.bin)\n"
               << "  -t <float>  DTW similarity threshold (default: " << DEFAULT_THRESHOLD << ")\n"
-              << "  -d          Debug mode (print scores)\n"
+              << "  -d          Debug mode (print scores to stderr)\n"
+              << "  -g          Graphical mode (SDL2 score bar window)\n"
               << "  -h          Show this help\n";
 }
 
@@ -172,6 +275,7 @@ int main(int argc, char **argv) {
     std::string templates_path = "models/templates.bin";
     float threshold = DEFAULT_THRESHOLD;
     bool debug = false;
+    bool use_gui = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -179,6 +283,7 @@ int main(int argc, char **argv) {
         else if (arg == "-e" && i + 1 < argc) templates_path = argv[++i];
         else if (arg == "-t" && i + 1 < argc) threshold = std::stof(argv[++i]);
         else if (arg == "-d") debug = true;
+        else if (arg == "-g") use_gui = true;
         else { print_usage(argv[0]); return 1; }
     }
 
@@ -209,6 +314,13 @@ int main(int argc, char **argv) {
     audio->resume();
     audio->clear();
 
+    // Init GUI
+    Gui gui;
+    if (use_gui && !gui.init()) {
+        std::cerr << "Failed to create GUI window, falling back to terminal" << std::endl;
+        use_gui = false;
+    }
+
     std::cout << "Listening... (threshold=" << threshold << ", Ctrl+C to stop)" << std::endl;
 
     const int max_encoder_frames = (buffer_samples / MEL_HOP + 1) / CONV_STRIDE + 1;
@@ -225,6 +337,8 @@ int main(int argc, char **argv) {
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(SLIDE_MS));
 
+        if (use_gui && gui.poll()) g_running = false;
+
         if (refractory > 0) {
             refractory--;
             audio->clear();
@@ -240,6 +354,7 @@ int main(int argc, char **argv) {
         energy /= pcm_buffer.size();
         if (energy < 1e-6f) {
             if (debug) std::cerr << "\r  ----  [                    ]        " << std::flush;
+            if (use_gui) gui.render(0.0f, threshold, false);
             continue;
         }
 
@@ -275,6 +390,8 @@ int main(int argc, char **argv) {
             std::snprintf(line, sizeof(line), "\r  %4.2f [%s] %3ldms  ", score, bar, total_ms);
             std::cerr << line << std::flush;
         }
+
+        if (use_gui) gui.render(score, threshold, score >= threshold);
 
         if (score >= threshold) {
             auto now = std::chrono::system_clock::now();

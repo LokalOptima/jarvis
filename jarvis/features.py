@@ -31,14 +31,16 @@ def _load_encoder():
     original_conv2 = encoder.conv2
     original_pe = encoder.positional_embedding
 
-    def flexible_forward(x: torch.Tensor) -> torch.Tensor:
+    def flexible_forward(x: torch.Tensor, return_layer: int = -1) -> torch.Tensor:
         x = torch.nn.functional.gelu(original_conv1(x))
         x = torch.nn.functional.gelu(original_conv2(x))
         x = x.permute(0, 2, 1)  # [B, T, C]
         seq_len = x.shape[1]
         x = (x + original_pe[:seq_len]).to(x.dtype)
-        for block in original_blocks:
+        for i, block in enumerate(original_blocks):
             x = block(x)
+            if return_layer >= 0 and i == return_layer:
+                return x
         x = original_ln(x)
         return x
 
@@ -46,11 +48,12 @@ def _load_encoder():
     return encoder
 
 
-def extract_features(audio: np.ndarray | str | Path) -> np.ndarray:
+def extract_features(audio: np.ndarray | str | Path, layer: int = -1) -> np.ndarray:
     """Extract encoder features from audio.
 
     Args:
         audio: float32/int16 numpy array (mono 16kHz), or path to WAV file.
+        layer: Encoder layer to extract from (0-3 for Tiny, -1 for final output).
 
     Returns:
         Features array of shape [T, 384] where T depends on audio length.
@@ -67,6 +70,6 @@ def extract_features(audio: np.ndarray | str | Path) -> np.ndarray:
     mel = whisper.log_mel_spectrogram(audio, n_mels=80).unsqueeze(0)
 
     with torch.no_grad():
-        features = encoder(mel)
+        features = encoder(mel, return_layer=layer)
 
     return features.squeeze(0).numpy()
