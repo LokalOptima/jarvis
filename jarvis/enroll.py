@@ -27,7 +27,8 @@ from pathlib import Path
 import numpy as np
 import whisper as whisper_asr
 
-from jarvis import RATE, DATA_DIR, CLIPS_DIR, MODELS_DIR, MAX_TEMPLATE_FRAMES
+from jarvis import RATE, DATA_DIR, CLIPS_DIR, MODELS_DIR, MAX_TEMPLATE_FRAMES, ONSET_SKIP
+from jarvis.dtw import cmvn, dba
 from jarvis.features import extract_features
 
 CLIP_PAD_SEC = 0.3   # padding around detected wake word boundaries
@@ -130,42 +131,44 @@ def save_clips(clips: list[np.ndarray]) -> list[Path]:
 
 
 def build_templates():
-    """Read clips, extract full frame sequences, save templates."""
+    """Read clips, extract features, apply CMVN + DBA, save template."""
     wav_files = sorted(CLIPS_DIR.glob("*.wav"))
     if not wav_files:
         print(f"No clips in {CLIPS_DIR}/")
         print("Run 'python -m jarvis.enroll' first to record and extract clips.")
         sys.exit(1)
 
-    print(f"Building templates from {len(wav_files)} clips...")
+    print(f"Extracting features from {len(wav_files)} clips...")
 
-    templates = []  # list of [T_i, 384] arrays
+    raw_features = []
     for i, wav_path in enumerate(wav_files):
         with wave.open(str(wav_path), "rb") as wf:
             audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
-        features = extract_features(audio)  # [T, 384]
-        features = features[:MAX_TEMPLATE_FRAMES]
-
-        # L2-normalize each frame so C++ can skip template norm computation
-        norms = np.linalg.norm(features, axis=1, keepdims=True)
-        features = features / np.maximum(norms, 1e-10)
-
-        templates.append(features)
+        features = extract_features(audio)
+        features = features[ONSET_SKIP:MAX_TEMPLATE_FRAMES]
+        raw_features.append(features)
         if (i + 1) % 5 == 0 or i == 0 or i == len(wav_files) - 1:
             print(f"  [{i + 1}/{len(wav_files)}] {wav_path.name} ({features.shape[0]} frames)")
 
+    # CMVN per clip, then DBA to merge all into 1 representative template
+    print(f"\nApplying CMVN + DBA ({len(raw_features)} clips -> 1 template)...")
+    cmvn_features = [cmvn(f) for f in raw_features]
+    template = dba(cmvn_features, n_iter=5)
+
+    # L2-normalize each frame so C++ can skip template norm computation
+    norms = np.linalg.norm(template, axis=1, keepdims=True)
+    template = template / np.maximum(norms, 1e-10)
+
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Binary format: int32 n_templates, then per template: int32 n_frames, float[n_frames * 384]
+    # Binary format: int32 n_templates, per template: int32 n_frames, float[n_frames * 384]
     bin_path = MODELS_DIR / "templates.bin"
     with open(bin_path, "wb") as f:
-        f.write(struct.pack("i", len(templates)))
-        for feat in templates:
-            f.write(struct.pack("i", feat.shape[0]))
-            f.write(feat.astype(np.float32).tobytes())
+        f.write(struct.pack("i", 1))  # 1 DBA template
+        f.write(struct.pack("i", template.shape[0]))
+        f.write(template.astype(np.float32).tobytes())
 
-    total_frames = sum(t.shape[0] for t in templates)
-    print(f"\n  {len(templates)} templates, {total_frames} total frames (384-dim, L2-normalized)")
+    print(f"\n  1 DBA template, {template.shape[0]} frames (384-dim, CMVN + L2-normalized)")
     print(f"  {bin_path} ({bin_path.stat().st_size} bytes)")
 
 

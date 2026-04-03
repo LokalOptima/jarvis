@@ -38,6 +38,9 @@ audio_async::~audio_async() {
 bool audio_async::init(int capture_id, int sample_rate) {
     SDL_LogSetPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO);
 
+    // Prevent SDL from probing X11/XCB when we only need audio
+    SDL_SetHint(SDL_HINT_VIDEODRIVER, "dummy");
+
     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Couldn't initialize SDL: %s\n", SDL_GetError());
         return false;

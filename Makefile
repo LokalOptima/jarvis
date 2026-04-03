@@ -8,7 +8,7 @@ build:
 	uv run python -m jarvis.enroll --build
 
 run:
-	./build/jarvis -m models/ggml-tiny.bin -e models/templates.bin -g
+	./build/jarvis -m models/ggml-tiny.bin -e models/templates.bin
 
 compile:
 	cmake -B build -DCMAKE_BUILD_TYPE=Release

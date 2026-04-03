@@ -12,8 +12,6 @@
 #include <whisper.h>
 #include <audio_async.hpp>
 
-#include <SDL.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -35,112 +33,93 @@
 #define WHISPER_DIM       384    // Whisper Tiny encoder embedding dimension
 #define MEL_HOP           160    // Mel spectrogram hop length in samples
 #define CONV_STRIDE       2      // Whisper encoder conv2 stride
-#define DEFAULT_THRESHOLD 0.80f  // DTW similarity threshold
+#define DEFAULT_THRESHOLD 0.35f  // DTW similarity threshold
+#define ONSET_SKIP        2      // Skip first N encoder frames (Whisper "start of audio" artifact)
+#define STEP_PENALTY      0.1f   // DTW non-diagonal transition penalty
 
-// ---- Optional SDL2 GUI ----
+// ---- Terminal visualizer ----
 
-struct Gui {
-    SDL_Window   *window   = nullptr;
-    SDL_Renderer *renderer = nullptr;
-    int flash = 0;
+static void render_bar(float score, float threshold, int ms, bool silent) {
+    static char buf[768];
+    char *p = buf;
 
-    bool init() {
-        if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
-            std::cerr << "SDL video init failed: " << SDL_GetError() << std::endl;
-            return false;
+    constexpr int W = 50;
+    int thr = std::max(0, std::min(W - 1, (int)(threshold * W)));
+
+    *p++ = '\r'; *p++ = ' '; *p++ = ' ';
+
+    if (silent) {
+        memcpy(p, "\033[2m", 4); p += 4;
+        for (int i = 0; i < W; i++) {
+            if (i == thr) { memcpy(p, "\xe2\x94\x82", 3); p += 3; }  // │
+            else          { memcpy(p, "\xc2\xb7", 2); p += 2; }       // ·
         }
-        window = SDL_CreateWindow("Jarvis - Wake Word",
-                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                  500, 100,
-                                  SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-        if (!window) {
-            std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
-            return false;
+        memcpy(p, "\033[0m  ----\033[K", 14); p += 14;
+    } else {
+        int filled = std::max(0, std::min(W, (int)(score * W)));
+        static const char *esc[]  = { "\033[32m", "\033[1;31m", "\033[2m", "\033[33m" };
+        static const int esc_len[] = { 5, 7, 4, 5 };
+        int color = -1;
+
+        for (int i = 0; i < W; i++) {
+            int want;
+            if      (i == thr)              want = 3;  // yellow
+            else if (i < filled && i < thr) want = 0;  // green
+            else if (i < filled)            want = 1;  // red
+            else                            want = 2;  // dim
+
+            if (want != color) {
+                memcpy(p, esc[want], esc_len[want]);
+                p += esc_len[want];
+                color = want;
+            }
+
+            if (i == thr)        { memcpy(p, "\xe2\x94\x82", 3); p += 3; }  // │
+            else if (i < filled) { memcpy(p, "\xe2\x96\x88", 3); p += 3; }  // █
+            else                 { memcpy(p, "\xc2\xb7", 2); p += 2; }       // ·
         }
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-        if (!renderer) {
-            // Fallback to software renderer
-            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-        }
-        if (!renderer) {
-            std::cerr << "SDL_CreateRenderer failed: " << SDL_GetError() << std::endl;
-            return false;
-        }
-        // Initial paint so the window appears immediately
-        SDL_SetRenderDrawColor(renderer, 28, 28, 28, 255);
-        SDL_RenderClear(renderer);
-        SDL_RenderPresent(renderer);
-        SDL_PumpEvents();
-        return true;
+
+        p += std::snprintf(p, 64, "\033[0m  %4.2f  %3dms\033[K", score, ms);
     }
 
-    // Returns true if the user requested quit (window close or 'q')
-    bool poll() {
-        SDL_Event e;
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) return true;
-            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_q) return true;
-        }
-        return false;
-    }
-
-    void render(float score, float threshold, bool detected) {
-        if (!renderer) return;
-        if (detected) flash = 12;
-
-        int w, h;
-        SDL_GetWindowSize(window, &w, &h);
-
-        const int pad   = 16;
-        const int bar_h = h / 3;
-        const int bar_y = (h - bar_h) / 2;
-        const int bar_w = w - 2 * pad;
-
-        // Background: flash green on detection, dark otherwise
-        if (flash > 0) {
-            uint8_t v = (uint8_t)(60 + flash * 16);
-            SDL_SetRenderDrawColor(renderer, 20, v, 20, 255);
-            flash--;
-        } else {
-            SDL_SetRenderDrawColor(renderer, 28, 28, 28, 255);
-        }
-        SDL_RenderClear(renderer);
-
-        // Track (full-width dark bar)
-        SDL_SetRenderDrawColor(renderer, 55, 55, 55, 255);
-        SDL_Rect track = {pad, bar_y, bar_w, bar_h};
-        SDL_RenderFillRect(renderer, &track);
-
-        // Score fill: green → yellow → red as score approaches/exceeds threshold
-        float t = std::min(score / (threshold > 0 ? threshold : 1.0f), 1.0f);
-        uint8_t r = (uint8_t)(std::min(255.0f, 510.0f * t));
-        uint8_t g = (uint8_t)(std::min(255.0f, 510.0f * (1.0f - t)));
-        SDL_SetRenderDrawColor(renderer, r, g, 40, 255);
-        int fill_w = (int)(score * bar_w);
-        if (fill_w > 0) {
-            SDL_Rect fill = {pad, bar_y, std::min(fill_w, bar_w), bar_h};
-            SDL_RenderFillRect(renderer, &fill);
-        }
-
-        // Threshold marker: vertical yellow line
-        int th_x = pad + (int)(threshold * bar_w);
-        SDL_SetRenderDrawColor(renderer, 255, 220, 0, 255);
-        SDL_RenderDrawLine(renderer, th_x, bar_y - 5, th_x, bar_y + bar_h + 5);
-
-        SDL_RenderPresent(renderer);
-        SDL_PumpEvents();
-    }
-
-    ~Gui() {
-        if (renderer) SDL_DestroyRenderer(renderer);
-        if (window)   SDL_DestroyWindow(window);
-    }
-};
+    fwrite(buf, 1, p - buf, stderr);
+}
 
 // ---- Signal handling ----
 
 static volatile bool g_running = true;
 static void signal_handler(int) { g_running = false; }
+
+// ---- CMVN (Cepstral Mean and Variance Normalization) ----
+// Removes per-dimension DC offset from encoder features.
+// After CMVN, only relative variation between frames matters — the shared
+// "average speech" direction is subtracted out, dramatically improving discrimination.
+
+static void apply_cmvn(float *frames, int n_frames) {
+    float mean[WHISPER_DIM] = {};
+    float var[WHISPER_DIM] = {};
+
+    for (int t = 0; t < n_frames; t++) {
+        const float *f = frames + t * WHISPER_DIM;
+        for (int d = 0; d < WHISPER_DIM; d++) mean[d] += f[d];
+    }
+    float inv_n = 1.0f / n_frames;
+    for (int d = 0; d < WHISPER_DIM; d++) mean[d] *= inv_n;
+
+    for (int t = 0; t < n_frames; t++) {
+        const float *f = frames + t * WHISPER_DIM;
+        for (int d = 0; d < WHISPER_DIM; d++) {
+            float diff = f[d] - mean[d];
+            var[d] += diff * diff;
+        }
+    }
+    for (int d = 0; d < WHISPER_DIM; d++) var[d] = 1.0f / (std::sqrt(var[d] * inv_n) + 1e-10f);
+
+    for (int t = 0; t < n_frames; t++) {
+        float *f = frames + t * WHISPER_DIM;
+        for (int d = 0; d < WHISPER_DIM; d++) f[d] = (f[d] - mean[d]) * var[d];
+    }
+}
 
 // ---- Template matching with subsequence DTW ----
 
@@ -231,10 +210,13 @@ struct Templates {
             curr_row[0] = 0.0f;
             for (int j = 1; j <= n_tmpl; j++) {
                 float c = 1.0f - cosine_dot(input + (i - 1) * WHISPER_DIM, tmpl.frame(j - 1), inv_norms[i - 1]);
-                float prev = prev_row[j - 1];
-                if (prev_row[j] < prev) prev = prev_row[j];
-                if (curr_row[j - 1] < prev) prev = curr_row[j - 1];
-                curr_row[j] = c + prev;
+                float diag = prev_row[j - 1];
+                float ins  = prev_row[j] + STEP_PENALTY;
+                float del  = curr_row[j - 1] + STEP_PENALTY;
+                float best_prev = diag;
+                if (ins < best_prev) best_prev = ins;
+                if (del < best_prev) best_prev = del;
+                curr_row[j] = c + best_prev;
             }
             if (curr_row[n_tmpl] < best) best = curr_row[n_tmpl];
             std::swap(prev_row, curr_row);
@@ -265,8 +247,6 @@ static void print_usage(const char *prog) {
               << "  -m <path>   Whisper model (default: models/ggml-tiny.bin)\n"
               << "  -e <path>   Enrolled templates (default: models/templates.bin)\n"
               << "  -t <float>  DTW similarity threshold (default: " << DEFAULT_THRESHOLD << ")\n"
-              << "  -d          Debug mode (print scores to stderr)\n"
-              << "  -g          Graphical mode (SDL2 score bar window)\n"
               << "  -h          Show this help\n";
 }
 
@@ -274,16 +254,12 @@ int main(int argc, char **argv) {
     std::string whisper_path   = "models/ggml-tiny.bin";
     std::string templates_path = "models/templates.bin";
     float threshold = DEFAULT_THRESHOLD;
-    bool debug = false;
-    bool use_gui = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-m" && i + 1 < argc) whisper_path = argv[++i];
         else if (arg == "-e" && i + 1 < argc) templates_path = argv[++i];
         else if (arg == "-t" && i + 1 < argc) threshold = std::stof(argv[++i]);
-        else if (arg == "-d") debug = true;
-        else if (arg == "-g") use_gui = true;
         else { print_usage(argv[0]); return 1; }
     }
 
@@ -314,13 +290,6 @@ int main(int argc, char **argv) {
     audio->resume();
     audio->clear();
 
-    // Init GUI
-    Gui gui;
-    if (use_gui && !gui.init()) {
-        std::cerr << "Failed to create GUI window, falling back to terminal" << std::endl;
-        use_gui = false;
-    }
-
     std::cout << "Listening... (threshold=" << threshold << ", Ctrl+C to stop)" << std::endl;
 
     const int max_encoder_frames = (buffer_samples / MEL_HOP + 1) / CONV_STRIDE + 1;
@@ -337,8 +306,6 @@ int main(int argc, char **argv) {
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(SLIDE_MS));
 
-        if (use_gui && gui.poll()) g_running = false;
-
         if (refractory > 0) {
             refractory--;
             audio->clear();
@@ -353,8 +320,7 @@ int main(int argc, char **argv) {
         for (auto s : pcm_buffer) energy += s * s;
         energy /= pcm_buffer.size();
         if (energy < 1e-6f) {
-            if (debug) std::cerr << "\r  ----  [                    ]        " << std::flush;
-            if (use_gui) gui.render(0.0f, threshold, false);
+            render_bar(0.0f, threshold, 0, true);
             continue;
         }
 
@@ -367,31 +333,23 @@ int main(int argc, char **argv) {
         if (actual_frames <= 0) actual_frames = 1;
         whisper_set_audio_ctx(ctx, actual_frames);
 
-        auto t1 = std::chrono::steady_clock::now();
         if (whisper_encode(ctx, 0, 1) != 0) continue;
-        auto t2 = std::chrono::steady_clock::now();
 
         int n_floats = whisper_encoder_output(ctx, encoder_output.data(), max_encoder_floats);
         if (n_floats <= 0) continue;
         int n_enc_frames = n_floats / WHISPER_DIM;
 
+        float *enc_ptr = encoder_output.data() + ONSET_SKIP * WHISPER_DIM;
+        n_enc_frames -= ONSET_SKIP;
+        if (n_enc_frames <= 0) continue;
+        apply_cmvn(enc_ptr, n_enc_frames);
+
         // DTW match against templates
-        float score = templates.match(encoder_output.data(), n_enc_frames, inv_norms, dtw_row_a, dtw_row_b);
-        auto t3 = std::chrono::steady_clock::now();
+        float score = templates.match(enc_ptr, n_enc_frames, inv_norms, dtw_row_a, dtw_row_b);
+        auto t1 = std::chrono::steady_clock::now();
+        int total_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-        if (debug) {
-            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t0).count();
-            int bar_len = 20;
-            int filled = std::max(0, std::min(bar_len, static_cast<int>(score * bar_len)));
-            char bar[21];
-            for (int i = 0; i < bar_len; i++) bar[i] = i < filled ? '|' : ' ';
-            bar[bar_len] = '\0';
-            char line[128];
-            std::snprintf(line, sizeof(line), "\r  %4.2f [%s] %3ldms  ", score, bar, total_ms);
-            std::cerr << line << std::flush;
-        }
-
-        if (use_gui) gui.render(score, threshold, score >= threshold);
+        render_bar(score, threshold, total_ms, false);
 
         if (score >= threshold) {
             auto now = std::chrono::system_clock::now();
