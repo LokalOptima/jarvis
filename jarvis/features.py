@@ -1,75 +1,61 @@
-"""Extract Whisper Tiny encoder features from audio.
+"""Extract Whisper encoder features from audio using our C++ encoder.
 
-Uses openai-whisper Python for feature extraction at enrollment time.
-The C++ runtime uses whisper.cpp for the same computation.
+Calls build/encode which uses the same whisper.cpp code path as the
+detector, ensuring templates match runtime embeddings exactly.
 """
 
-import functools
+import struct
+import subprocess
 from pathlib import Path
 
 import numpy as np
-import torch
-import whisper
 
-from jarvis import RATE
+from jarvis import MODELS_DIR
 
-
-@functools.cache
-def _load_encoder():
-    """Load Whisper Tiny encoder with variable-length support."""
-    model = whisper.load_model("tiny", device="cpu")
-    encoder = model.encoder
-    encoder.eval()
-
-    # Monkey-patch forward to support variable-length input.
-    # The original forward hardcodes positional_embedding[:1500].
-    # Since Whisper uses sinusoidal (absolute) positional encoding,
-    # slicing to actual sequence length is mathematically correct.
-    original_blocks = encoder.blocks
-    original_ln = encoder.ln_post
-    original_conv1 = encoder.conv1
-    original_conv2 = encoder.conv2
-    original_pe = encoder.positional_embedding
-
-    def flexible_forward(x: torch.Tensor, return_layer: int = -1) -> torch.Tensor:
-        x = torch.nn.functional.gelu(original_conv1(x))
-        x = torch.nn.functional.gelu(original_conv2(x))
-        x = x.permute(0, 2, 1)  # [B, T, C]
-        seq_len = x.shape[1]
-        x = (x + original_pe[:seq_len]).to(x.dtype)
-        for i, block in enumerate(original_blocks):
-            x = block(x)
-            if return_layer >= 0 and i == return_layer:
-                return x
-        x = original_ln(x)
-        return x
-
-    encoder.forward = flexible_forward
-    return encoder
+ENCODE_BIN = Path(__file__).parent.parent / "build" / "encode"
+MODEL_PATH = MODELS_DIR / "ggml-tiny.bin"
 
 
-def extract_features(audio: np.ndarray | str | Path, layer: int = -1) -> np.ndarray:
-    """Extract encoder features from audio.
+def extract_features(wav_path: str | Path) -> np.ndarray:
+    """Extract encoder features from a WAV file.
 
     Args:
-        audio: float32/int16 numpy array (mono 16kHz), or path to WAV file.
-        layer: Encoder layer to extract from (0-3 for Tiny, -1 for final output).
+        wav_path: path to mono 16-bit 16kHz PCM WAV file.
 
     Returns:
         Features array of shape [T, 384] where T depends on audio length.
     """
-    if isinstance(audio, (str, Path)):
-        audio = whisper.load_audio(str(audio))
+    return extract_features_batch([wav_path])[0]
 
-    if isinstance(audio, np.ndarray):
-        if audio.dtype == np.int16:
-            audio = audio.astype(np.float32) / 32768.0
-        audio = torch.from_numpy(audio)
 
-    encoder = _load_encoder()
-    mel = whisper.log_mel_spectrogram(audio, n_mels=80).unsqueeze(0)
+def extract_features_batch(wav_paths: list[str | Path]) -> list[np.ndarray]:
+    """Extract encoder features from multiple WAV files in a single model load.
 
-    with torch.no_grad():
-        features = encoder(mel, return_layer=layer)
+    Args:
+        wav_paths: list of paths to mono 16-bit 16kHz PCM WAV files.
 
-    return features.squeeze(0).numpy()
+    Returns:
+        List of feature arrays, each shape [T, 384].
+    """
+    result = subprocess.run(
+        [ENCODE_BIN, MODEL_PATH] + [str(p) for p in wav_paths],
+        stdout=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"encode failed (exit {result.returncode})")
+
+    buf = result.stdout
+    offset = 0
+    features = []
+    for wav_path in wav_paths:
+        n_frames = struct.unpack_from("i", buf, offset)[0]; offset += 4
+        dim = struct.unpack_from("i", buf, offset)[0]; offset += 4
+
+        if n_frames == 0:
+            raise RuntimeError(f"encode returned 0 frames for {wav_path}")
+
+        data = np.frombuffer(buf, dtype=np.float32, count=n_frames * dim, offset=offset)
+        offset += n_frames * dim * 4
+        features.append(data.reshape(n_frames, dim))
+
+    return features

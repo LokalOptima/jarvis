@@ -2804,6 +2804,10 @@ int whisper_n_len(struct whisper_context * ctx) {
     return ctx->state->mel.n_len_org;
 }
 
+int whisper_model_n_audio_state(struct whisper_context * ctx) {
+    return ctx->model.hparams.n_audio_state;
+}
+
 ////////////////////////////////////////////////////////////////////////////
 
 void whisper_log_set(ggml_log_callback log_callback, void * user_data) {

@@ -1,10 +1,14 @@
 [project]
 name = "soundtools"
-version = "0.3.0"
+version = "0.4.0"
 description = "Personalized wake word detection using Whisper Tiny encoder"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
+]
+
+[project.optional-dependencies]
+enroll = [
     "sounddevice",
     "openai-whisper>=20250625",
     "torch>=2.11.0",

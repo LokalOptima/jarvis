@@ -26,14 +26,13 @@ import wave
 from pathlib import Path
 
 import numpy as np
-import whisper as whisper_asr
 
 from jarvis import (
     RATE, DATA_DIR, CLIPS_DIR, TEMPLATES_DIR,
     MAX_TEMPLATE_FRAMES, ONSET_SKIP, keyword_name, list_keyword_dirs,
 )
 from jarvis.dtw import cmvn, dba
-from jarvis.features import extract_features
+from jarvis.features import extract_features_batch
 
 CLIP_PAD_SEC = 0.3   # padding around detected wake word boundaries
 MIN_CLIP_SEC = 0.4   # minimum clip length to keep
@@ -42,7 +41,7 @@ SILENCE_MARGIN = int(RATE * 0.05)  # 50ms margin when trimming silence
 
 def find_wake_words(
     audio: str | np.ndarray,
-    model: whisper_asr.Whisper,
+    model,
     wake_words: list[str],
 ) -> list[tuple[float, float]]:
     """Find wake word timestamps in audio. Returns (start, end) pairs.
@@ -149,11 +148,9 @@ def _build_keyword(keyword_dir: Path) -> bool:
     print(f"\n--- {keyword} ({len(wav_files)} clips) ---")
     print(f"Extracting features...")
 
+    all_features = extract_features_batch(wav_files)
     raw_features = []
-    for i, wav_path in enumerate(wav_files):
-        with wave.open(str(wav_path), "rb") as wf:
-            audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
-        features = extract_features(audio)
+    for i, (wav_path, features) in enumerate(zip(wav_files, all_features)):
         features = features[ONSET_SKIP:MAX_TEMPLATE_FRAMES]
         raw_features.append(features)
         if (i + 1) % 5 == 0 or i == 0 or i == len(wav_files) - 1:
@@ -219,6 +216,7 @@ def build_templates():
 def live_enroll(wake_words: list[str], device: int | None = None):
     """Record from mic, show live detections, extract on Ctrl+C."""
     import sounddevice as sd
+    import whisper as whisper_asr
 
     keyword = keyword_name(" ".join(wake_words))
     print("Loading Whisper Turbo...")
@@ -308,7 +306,7 @@ def live_enroll(wake_words: list[str], device: int | None = None):
 
 def process_audio(
     audio_path: str,
-    model: whisper_asr.Whisper,
+    model,
     wake_words: list[str],
 ) -> list[np.ndarray]:
     """Detect wake words in an audio file and return extracted clips.
@@ -316,6 +314,8 @@ def process_audio(
     Loads audio once and passes the float32 array to both transcription and
     clip extraction, avoiding a redundant ffmpeg decode.
     """
+    import whisper as whisper_asr
+
     audio = whisper_asr.load_audio(audio_path)
     detections = find_wake_words(audio, model, wake_words)
     if not detections:
@@ -328,6 +328,8 @@ def process_audio(
 
 def file_enroll(audio_files: list[str], wake_words: list[str]):
     """Extract clips from pre-recorded audio files."""
+    import whisper as whisper_asr
+
     keyword = keyword_name(" ".join(wake_words))
     print("Loading Whisper Turbo...")
     labeler = whisper_asr.load_model("turbo")

@@ -27,6 +27,30 @@ target_include_directories(jarvis PRIVATE
 )
 target_link_libraries(jarvis ggml ${SDL2_LIBRARIES})
 
+# ---- Encode: extract encoder embeddings from WAV files ----
+add_executable(encode
+    src/encode.cpp
+    src/whisper.cpp
+)
+target_include_directories(encode PRIVATE
+    src
+    lib
+    lib/ggml/include
+)
+target_link_libraries(encode ggml)
+
+# ---- Bench: model benchmark ----
+add_executable(bench
+    src/bench.cpp
+    src/whisper.cpp
+)
+target_include_directories(bench PRIVATE
+    src
+    lib
+    lib/ggml/include
+)
+target_link_libraries(bench ggml)
+
 # ---- Weather: fetch + speak utility ----
 add_executable(weather
     src/weather.cpp
