@@ -37,13 +37,17 @@ SILENCE_MARGIN = int(RATE * 0.05)  # 50ms margin when trimming silence
 
 
 def find_wake_words(
-    audio_path: str,
+    audio: str | np.ndarray,
     model: whisper_asr.Whisper,
     wake_words: list[str],
 ) -> list[tuple[float, float]]:
-    """Find wake word timestamps in audio. Returns (start, end) pairs."""
+    """Find wake word timestamps in audio. Returns (start, end) pairs.
+
+    Args:
+        audio: path to audio file, or float32 numpy array (mono, 16kHz).
+    """
     result = model.transcribe(
-        audio_path, word_timestamps=True, language="en", no_speech_threshold=0.5,
+        audio, word_timestamps=True, language="en", no_speech_threshold=0.5,
     )
 
     words = []
@@ -263,6 +267,24 @@ def live_enroll(wake_words: list[str], device: int | None = None):
     print(f"\nRun 'python -m jarvis.enroll --build' to generate templates.")
 
 
+def process_audio(
+    audio_path: str,
+    model: whisper_asr.Whisper,
+    wake_words: list[str],
+) -> list[np.ndarray]:
+    """Detect wake words in an audio file and return extracted clips.
+
+    Loads audio once and passes the float32 array to both transcription and
+    clip extraction, avoiding a redundant ffmpeg decode.
+    """
+    audio = whisper_asr.load_audio(audio_path)
+    detections = find_wake_words(audio, model, wake_words)
+    if not detections:
+        return []
+    audio_int16 = (audio * 32768).clip(-32768, 32767).astype(np.int16)
+    return extract_clips_from_audio(audio_int16, detections)
+
+
 # ---- File-based extraction ----
 
 def file_enroll(audio_files: list[str], wake_words: list[str]):
@@ -278,14 +300,8 @@ def file_enroll(audio_files: list[str], wake_words: list[str]):
             continue
 
         print(f"\n  {p.name}:")
-        detections = find_wake_words(str(p), labeler, wake_words)
-        print(f"    {len(detections)} detections")
-        for start, end in detections:
-            print(f"      {start:.2f}s - {end:.2f}s")
-
-        audio = whisper_asr.load_audio(str(p))
-        audio_int16 = (audio * 32768).clip(-32768, 32767).astype(np.int16)
-        clips = extract_clips_from_audio(audio_int16, detections)
+        clips = process_audio(str(p), labeler, wake_words)
+        print(f"    {len(clips)} clips extracted")
         all_clips.extend(clips)
 
     if not all_clips:

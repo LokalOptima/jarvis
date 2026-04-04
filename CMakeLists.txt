@@ -22,6 +22,17 @@ add_executable(jarvis
 target_include_directories(jarvis PRIVATE
     ${SDL2_INCLUDE_DIRS}
     src
+    lib
     lib/whisper.cpp/include
 )
 target_link_libraries(jarvis whisper ${SDL2_LIBRARIES})
+
+# ---- Weather: fetch + speak utility ----
+add_executable(weather
+    src/weather.cpp
+)
+target_include_directories(weather PRIVATE
+    src
+    lib
+)
+

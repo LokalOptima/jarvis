@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 // ---- Configuration ----
@@ -247,12 +248,14 @@ static void print_usage(const char *prog) {
               << "  -m <path>   Whisper model (default: models/ggml-tiny.bin)\n"
               << "  -e <path>   Enrolled templates (default: models/templates.bin)\n"
               << "  -t <float>  DTW similarity threshold (default: " << DEFAULT_THRESHOLD << ")\n"
+              << "  -c <cmd>    Command to run on detection\n"
               << "  -h          Show this help\n";
 }
 
 int main(int argc, char **argv) {
     std::string whisper_path   = "models/ggml-tiny.bin";
     std::string templates_path = "models/templates.bin";
+    std::string on_detect;
     float threshold = DEFAULT_THRESHOLD;
 
     for (int i = 1; i < argc; i++) {
@@ -260,10 +263,12 @@ int main(int argc, char **argv) {
         if (arg == "-m" && i + 1 < argc) whisper_path = argv[++i];
         else if (arg == "-e" && i + 1 < argc) templates_path = argv[++i];
         else if (arg == "-t" && i + 1 < argc) threshold = std::stof(argv[++i]);
+        else if (arg == "-c" && i + 1 < argc) on_detect = argv[++i];
         else { print_usage(argv[0]); return 1; }
     }
 
     std::signal(SIGINT, signal_handler);
+    std::signal(SIGCHLD, SIG_IGN);  // auto-reap child processes
 
     // Load whisper
     struct whisper_context_params cparams = whisper_context_default_params();
@@ -358,6 +363,16 @@ int main(int argc, char **argv) {
             std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&t));
             std::cerr << "\r\033[K" << std::flush;
             std::cout << "  [" << time_buf << "] DETECTED  sim=" << score << std::endl;
+
+            if (!on_detect.empty()) {
+                pid_t pid = fork();
+                if (pid == 0) {
+                    execl("/bin/sh", "sh", "-c", on_detect.c_str(), nullptr);
+                    _exit(127);
+                } else if (pid < 0) {
+                    perror("fork");
+                }
+            }
 
             audio->clear();
             refractory = refractory_cycles;
