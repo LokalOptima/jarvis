@@ -25,6 +25,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// macOS doesn't have MSG_NOSIGNAL; it uses SO_NOSIGPIPE per-socket instead.
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 static constexpr int JARVIS_PORT = 7287;
 
 // Message types
@@ -131,6 +136,9 @@ static inline int tcp_connect(const char *host, int port) {
     if (fd >= 0) {
         int opt = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+#ifdef SO_NOSIGPIPE
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#endif
     }
     return fd;
 }

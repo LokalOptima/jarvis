@@ -16,9 +16,11 @@ bool audio_async::init(int capture_id, int sample_rate) {
     // Prevent SDL from probing X11/XCB when we only need audio
     SDL_SetHint(SDL_HINT_VIDEODRIVER, "dummy");
 
+#ifdef __linux__
     // Prefer native PipeWire over pulseaudio compat layer (pipewire-pulse),
     // which intermittently fails to route the capture source.
     setenv("SDL_AUDIODRIVER", "pipewire", 0);  // 0 = don't overwrite user's choice
+#endif
 
     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());

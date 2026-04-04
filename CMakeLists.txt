@@ -5,8 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---- ggml (vendored tensor library, CPU-only) ----
-set(GGML_METAL OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA  OFF CACHE BOOL "" FORCE)
+# Disable all non-CPU backends — our vendored ggml only has CPU source.
+# Without this, macOS auto-detects BLAS via Accelerate and fails to link.
+foreach(_backend BLAS METAL CUDA VULKAN OPENCL SYCL MUSA HIP CANN)
+    set(GGML_${_backend} OFF CACHE BOOL "" FORCE)
+endforeach()
 add_subdirectory(lib/ggml)
 
 find_package(SDL2 REQUIRED)
