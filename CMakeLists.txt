@@ -16,6 +16,9 @@ find_package(SDL2 REQUIRED)
 add_executable(jarvis
     src/main.cpp
     src/jarvis.cpp
+    src/detect.cpp
+    src/server.cpp
+    src/client.cpp
     src/whisper.cpp
     src/audio_async.cpp
 )
@@ -26,6 +29,17 @@ target_include_directories(jarvis PRIVATE
     lib/ggml/include
 )
 target_link_libraries(jarvis ggml ${SDL2_LIBRARIES})
+
+# ---- Jarvis client: lightweight mic streamer (SDL2 only, no whisper/ggml) ----
+add_executable(jarvis-client
+    src/jarvis-client.cpp
+    src/audio_async.cpp
+)
+target_include_directories(jarvis-client PRIVATE
+    ${SDL2_INCLUDE_DIRS}
+    src
+)
+target_link_libraries(jarvis-client ${SDL2_LIBRARIES} pthread)
 
 # ---- Encode: extract encoder embeddings from WAV files ----
 add_executable(encode

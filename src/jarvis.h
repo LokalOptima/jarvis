@@ -1,5 +1,5 @@
 /**
- * jarvis.h - Wake word detection API.
+ * jarvis.h - Wake word detection API (local mode).
  *
  * Register keywords with callbacks, then call listen() to start detecting.
  *
@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 struct Keyword {
     std::string name;
@@ -41,6 +42,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
+    std::vector<std::function<void(const std::string &, float)>> callbacks;
 };
 
 // Convenience: callback that fork+execs a shell command.
