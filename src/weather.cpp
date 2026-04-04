@@ -68,52 +68,43 @@ std::string get_weather_text() {
     while (!desc.empty() && desc.back() == ' ') desc.pop_back();
     for (auto &c : desc) c = std::tolower(static_cast<unsigned char>(c));
 
-    out << "Right now it's " << desc << ", " << temp << " degrees, feels like " << feels;
-    if (humid > 70)
-        out << ", with " << humid << " percent humidity";
-    out << ". ";
+    out << "It's " << temp << " degrees and " << desc << ". ";
 
-    // ---- Rest of today (summary) ----
-    int hour_now = current_hour();
+    // ---- Today summary ----
     auto &today_hourly = data["weather"][0]["hourly"];
     {
         int lo = 999, hi = -999;
-        std::unordered_map<std::string, int> desc_counts;
-        struct RainSlot { int hour; int pct; };
+        struct RainSlot { int hour; };
         std::vector<RainSlot> rainy;
-        bool any = false;
 
         for (auto &h : today_hourly) {
-            int hour = std::stoi(h["time"].get<std::string>()) / 100;
-            if (hour <= hour_now) continue;
-            any = true;
             int t    = std::stoi(h["tempC"].get<std::string>());
             int rain = std::stoi(h["chanceofrain"].get<std::string>());
-            std::string d = h["weatherDesc"][0]["value"].get<std::string>();
-            while (!d.empty() && d.back() == ' ') d.pop_back();
-            for (auto &c : d) c = std::tolower(static_cast<unsigned char>(c));
-
+            int hour = std::stoi(h["time"].get<std::string>()) / 100;
             if (t < lo) lo = t;
             if (t > hi) hi = t;
-            desc_counts[d]++;
-            if (rain >= 40) rainy.push_back({hour, rain});
+            if (rain >= 40) rainy.push_back({hour});
         }
 
-        if (any) {
+        out << "Today's high is " << hi << ", dropping to " << lo << " tonight. ";
+
+        if (!rainy.empty()) {
+            out << "Expect rain around " << rainy[0].hour << " o'clock. ";
+        } else {
+            // Overall condition for the day
+            std::unordered_map<std::string, int> desc_counts;
+            for (auto &h : today_hourly) {
+                std::string d = h["weatherDesc"][0]["value"].get<std::string>();
+                while (!d.empty() && d.back() == ' ') d.pop_back();
+                for (auto &c : d) c = std::tolower(static_cast<unsigned char>(c));
+                desc_counts[d]++;
+            }
             std::string dominant;
             int best_count = 0;
             for (auto &[d, cnt] : desc_counts) {
                 if (cnt > best_count) { dominant = d; best_count = cnt; }
             }
-            out << "Later, " << dominant << ", " << lo << " to " << hi << " degrees. ";
-            if (!rainy.empty()) {
-                out << "Rain expected around ";
-                for (size_t i = 0; i < rainy.size(); i++) {
-                    if (i > 0) out << ", ";
-                    out << rainy[i].hour << " o'clock";
-                }
-                out << ". ";
-            }
+            out << dominant << " all day. ";
         }
     }
 

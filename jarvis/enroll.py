@@ -10,9 +10,10 @@ Step 2 — Build templates from clips:
 
     uv run python -m jarvis.enroll --build
 
-    Reads data/clips/*.wav, extracts Whisper features, saves models/templates.bin
+    Reads data/clips/<keyword>/*.wav, extracts Whisper features,
+    saves models/templates/<keyword>.bin for each keyword.
 
-You can delete bad clips from data/clips/ between steps.
+You can delete bad clips from data/clips/<keyword>/ between steps.
 """
 
 import argparse
@@ -27,7 +28,10 @@ from pathlib import Path
 import numpy as np
 import whisper as whisper_asr
 
-from jarvis import RATE, DATA_DIR, CLIPS_DIR, MODELS_DIR, MAX_TEMPLATE_FRAMES, ONSET_SKIP
+from jarvis import (
+    RATE, DATA_DIR, CLIPS_DIR, TEMPLATES_DIR,
+    MAX_TEMPLATE_FRAMES, ONSET_SKIP, keyword_name, list_keyword_dirs,
+)
 from jarvis.dtw import cmvn, dba
 from jarvis.features import extract_features
 
@@ -108,41 +112,42 @@ def save_wav(path: Path, audio: np.ndarray):
         wf.writeframes(audio.tobytes())
 
 
-def next_clip_index() -> int:
+def next_clip_index(keyword_dir: Path) -> int:
     """Find the next available clip index (handles gaps from deletions)."""
-    existing = sorted(CLIPS_DIR.glob("clip_*.wav"))
+    existing = sorted(keyword_dir.glob("clip_*.wav"))
     if not existing:
         return 0
     last = existing[-1].stem  # "clip_0023"
     return int(last.split("_")[1]) + 1
 
 
-def save_clips(clips: list[np.ndarray]) -> list[Path]:
-    """Save extracted clips. Returns paths of new clips."""
-    CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+def save_clips(clips: list[np.ndarray], keyword: str) -> list[Path]:
+    """Save extracted clips to the keyword's clip directory. Returns paths of new clips."""
+    kw_dir = CLIPS_DIR / keyword
+    kw_dir.mkdir(parents=True, exist_ok=True)
 
-    idx = next_clip_index()
+    idx = next_clip_index(kw_dir)
     new_paths = []
     for i, clip in enumerate(clips):
-        p = CLIPS_DIR / f"clip_{idx + i:04d}.wav"
+        p = kw_dir / f"clip_{idx + i:04d}.wav"
         save_wav(p, clip)
         new_paths.append(p)
 
-    total = len(list(CLIPS_DIR.glob("*.wav")))
-    print(f"  {len(clips)} new clips saved to {CLIPS_DIR}/")
-    print(f"  Total clips: {total}")
+    total = len(list(kw_dir.glob("*.wav")))
+    print(f"  {len(clips)} new clips saved to {kw_dir}/")
+    print(f"  Total clips for '{keyword}': {total}")
     return new_paths
 
 
-def build_templates():
-    """Read clips, extract features, apply CMVN + DBA, save template."""
-    wav_files = sorted(CLIPS_DIR.glob("*.wav"))
+def _build_keyword(keyword_dir: Path) -> bool:
+    """Build a single keyword's template from its clips. Returns True on success."""
+    keyword = keyword_dir.name
+    wav_files = sorted(keyword_dir.glob("*.wav"))
     if not wav_files:
-        print(f"No clips in {CLIPS_DIR}/")
-        print("Run 'python -m jarvis.enroll' first to record and extract clips.")
-        sys.exit(1)
+        return False
 
-    print(f"Extracting features from {len(wav_files)} clips...")
+    print(f"\n--- {keyword} ({len(wav_files)} clips) ---")
+    print(f"Extracting features...")
 
     raw_features = []
     for i, wav_path in enumerate(wav_files):
@@ -155,7 +160,7 @@ def build_templates():
             print(f"  [{i + 1}/{len(wav_files)}] {wav_path.name} ({features.shape[0]} frames)")
 
     # CMVN per clip, then DBA to merge all into 1 representative template
-    print(f"\nApplying CMVN + DBA ({len(raw_features)} clips -> 1 template)...")
+    print(f"Applying CMVN + DBA ({len(raw_features)} clips -> 1 template)...")
     cmvn_features = [cmvn(f) for f in raw_features]
     template = dba(cmvn_features, n_iter=5)
 
@@ -163,17 +168,50 @@ def build_templates():
     norms = np.linalg.norm(template, axis=1, keepdims=True)
     template = template / np.maximum(norms, 1e-10)
 
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 
     # Binary format: int32 n_templates, per template: int32 n_frames, float[n_frames * 384]
-    bin_path = MODELS_DIR / "templates.bin"
+    bin_path = TEMPLATES_DIR / f"{keyword}.bin"
     with open(bin_path, "wb") as f:
         f.write(struct.pack("i", 1))  # 1 DBA template
         f.write(struct.pack("i", template.shape[0]))
         f.write(template.astype(np.float32).tobytes())
 
-    print(f"\n  1 DBA template, {template.shape[0]} frames (384-dim, CMVN + L2-normalized)")
+    print(f"  1 DBA template, {template.shape[0]} frames (384-dim, CMVN + L2-normalized)")
     print(f"  {bin_path} ({bin_path.stat().st_size} bytes)")
+    return True
+
+
+def build_templates():
+    """Read clips for all keywords, extract features, build templates."""
+    # Migrate old flat clips dir (data/clips/*.wav) to data/clips/hey_jarvis/
+    old_clips = sorted(CLIPS_DIR.glob("*.wav")) if CLIPS_DIR.exists() else []
+    if old_clips:
+        dest = CLIPS_DIR / "hey_jarvis"
+        dest.mkdir(parents=True, exist_ok=True)
+        print(f"Migrating {len(old_clips)} clips to {dest}/...")
+        for f in old_clips:
+            f.rename(dest / f.name)
+
+    keyword_dirs = list_keyword_dirs()
+
+    if not keyword_dirs:
+        print(f"No clips in {CLIPS_DIR}/")
+        print("Run 'uv run python -m jarvis.enroll' first to record and extract clips.")
+        sys.exit(1)
+
+    print(f"Found {len(keyword_dirs)} keyword(s): {', '.join(d.name for d in keyword_dirs)}")
+
+    built = 0
+    for keyword_dir in keyword_dirs:
+        if _build_keyword(keyword_dir):
+            built += 1
+
+    if built == 0:
+        print("\nNo templates built.")
+        sys.exit(1)
+
+    print(f"\nBuilt {built} keyword template(s) in {TEMPLATES_DIR}/")
 
 
 # ---- Live recording + extraction ----
@@ -182,6 +220,7 @@ def live_enroll(wake_words: list[str], device: int | None = None):
     """Record from mic, show live detections, extract on Ctrl+C."""
     import sounddevice as sd
 
+    keyword = keyword_name(" ".join(wake_words))
     print("Loading Whisper Turbo...")
     labeler = whisper_asr.load_model("turbo")
 
@@ -263,8 +302,8 @@ def live_enroll(wake_words: list[str], device: int | None = None):
         sys.exit(1)
 
     clips = extract_clips_from_audio(full_audio, detections)
-    save_clips(clips)
-    print(f"\nRun 'python -m jarvis.enroll --build' to generate templates.")
+    save_clips(clips, keyword)
+    print(f"\nRun 'uv run python -m jarvis.enroll --build' to generate templates.")
 
 
 def process_audio(
@@ -289,6 +328,7 @@ def process_audio(
 
 def file_enroll(audio_files: list[str], wake_words: list[str]):
     """Extract clips from pre-recorded audio files."""
+    keyword = keyword_name(" ".join(wake_words))
     print("Loading Whisper Turbo...")
     labeler = whisper_asr.load_model("turbo")
 
@@ -308,8 +348,8 @@ def file_enroll(audio_files: list[str], wake_words: list[str]):
         print("\nNo wake words found.")
         sys.exit(1)
 
-    save_clips(all_clips)
-    print(f"\nRun 'python -m jarvis.enroll --build' to generate templates.")
+    save_clips(all_clips, keyword)
+    print(f"\nRun 'uv run python -m jarvis.enroll --build' to generate templates.")
 
 
 def main():

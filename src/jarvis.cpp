@@ -1,18 +1,17 @@
 /**
- * jarvis - Personalized wake word detector using Whisper Tiny encoder.
+ * jarvis.cpp - Wake word detection engine.
  *
  * Pipeline:
  *   SDL2 mic capture → ring buffer → whisper mel + encode
- *   → subsequence DTW against enrolled templates → detect
- *
- * No training required. Just enroll with your own recordings (see jarvis/enroll.py).
- * Templates are stored as a binary file (models/templates.bin).
+ *   → CMVN → subsequence DTW against enrolled templates → detect → callback
  */
 
-#include <whisper.h>
+#include "jarvis.h"
+#include "whisper.h"
 #include <audio_async.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -29,33 +28,45 @@
 // ---- Configuration ----
 
 #define SAMPLE_RATE       16000
-#define BUFFER_SEC        2.0f   // Audio buffer length
-#define SLIDE_MS          200    // Detection interval (milliseconds)
-#define WHISPER_DIM       384    // Whisper Tiny encoder embedding dimension
-#define MEL_HOP           160    // Mel spectrogram hop length in samples
-#define CONV_STRIDE       2      // Whisper encoder conv2 stride
-#define DEFAULT_THRESHOLD 0.35f  // DTW similarity threshold
-#define ONSET_SKIP        2      // Skip first N encoder frames (Whisper "start of audio" artifact)
-#define STEP_PENALTY      0.1f   // DTW non-diagonal transition penalty
+#define BUFFER_SEC        2.0f
+#define SLIDE_MS          200
+#define WHISPER_DIM       384
+#define MEL_HOP           160
+#define CONV_STRIDE       2
+#define ONSET_SKIP        2
+#define STEP_PENALTY      0.1f
+
+// ---- Signal handling ----
+
+static std::atomic<bool> g_running{true};
+static void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
 
 // ---- Terminal visualizer ----
 
-static void render_bar(float score, float threshold, int ms, bool silent) {
+static void render_bar(const char *name, float score, float threshold, int ms, bool silent) {
     static char buf[768];
     char *p = buf;
 
-    constexpr int W = 50;
+    constexpr int NAME_W = 14;
+    constexpr int W = 36;
     int thr = std::max(0, std::min(W - 1, (int)(threshold * W)));
 
     *p++ = '\r'; *p++ = ' '; *p++ = ' ';
 
+    int nlen = (int)strlen(name);
+    int copy = std::min(nlen, NAME_W);
+    memcpy(p, name, copy); p += copy;
+    for (int i = copy; i < NAME_W; i++) *p++ = ' ';
+
     if (silent) {
+        int filled = std::max(0, std::min(W, (int)(score * W)));
         memcpy(p, "\033[2m", 4); p += 4;
         for (int i = 0; i < W; i++) {
-            if (i == thr) { memcpy(p, "\xe2\x94\x82", 3); p += 3; }  // │
-            else          { memcpy(p, "\xc2\xb7", 2); p += 2; }       // ·
+            if      (i < filled) { memcpy(p, "\xe2\x96\x88", 3); p += 3; }  // █
+            else if (i == thr)   { memcpy(p, "\xe2\x94\x82", 3); p += 3; }  // │
+            else                 { memcpy(p, "\xc2\xb7", 2); p += 2; }       // ·
         }
-        memcpy(p, "\033[0m  ----\033[K", 14); p += 14;
+        memcpy(p, "\033[0m\033[K", 7); p += 7;
     } else {
         int filled = std::max(0, std::min(W, (int)(score * W)));
         static const char *esc[]  = { "\033[32m", "\033[1;31m", "\033[2m", "\033[33m" };
@@ -64,10 +75,10 @@ static void render_bar(float score, float threshold, int ms, bool silent) {
 
         for (int i = 0; i < W; i++) {
             int want;
-            if      (i == thr)              want = 3;  // yellow
-            else if (i < filled && i < thr) want = 0;  // green
-            else if (i < filled)            want = 1;  // red
-            else                            want = 2;  // dim
+            if      (i == thr)              want = 3;
+            else if (i < filled && i < thr) want = 0;
+            else if (i < filled)            want = 1;
+            else                            want = 2;
 
             if (want != color) {
                 memcpy(p, esc[want], esc_len[want]);
@@ -75,9 +86,9 @@ static void render_bar(float score, float threshold, int ms, bool silent) {
                 color = want;
             }
 
-            if (i == thr)        { memcpy(p, "\xe2\x94\x82", 3); p += 3; }  // │
-            else if (i < filled) { memcpy(p, "\xe2\x96\x88", 3); p += 3; }  // █
-            else                 { memcpy(p, "\xc2\xb7", 2); p += 2; }       // ·
+            if (i == thr)        { memcpy(p, "\xe2\x94\x82", 3); p += 3; }
+            else if (i < filled) { memcpy(p, "\xe2\x96\x88", 3); p += 3; }
+            else                 { memcpy(p, "\xc2\xb7", 2); p += 2; }
         }
 
         p += std::snprintf(p, 64, "\033[0m  %4.2f  %3dms\033[K", score, ms);
@@ -86,15 +97,7 @@ static void render_bar(float score, float threshold, int ms, bool silent) {
     fwrite(buf, 1, p - buf, stderr);
 }
 
-// ---- Signal handling ----
-
-static volatile bool g_running = true;
-static void signal_handler(int) { g_running = false; }
-
-// ---- CMVN (Cepstral Mean and Variance Normalization) ----
-// Removes per-dimension DC offset from encoder features.
-// After CMVN, only relative variation between frames matters — the shared
-// "average speech" direction is subtracted out, dramatically improving discrimination.
+// ---- CMVN ----
 
 static void apply_cmvn(float *frames, int n_frames) {
     float mean[WHISPER_DIM] = {};
@@ -122,12 +125,11 @@ static void apply_cmvn(float *frames, int n_frames) {
     }
 }
 
-// ---- Template matching with subsequence DTW ----
+// ---- Template matching ----
 
 struct Template {
-    std::vector<float> data;  // [n_frames * WHISPER_DIM], L2-normalized per frame
+    std::vector<float> data;
     int n_frames = 0;
-
     const float *frame(int t) const { return data.data() + t * WHISPER_DIM; }
 };
 
@@ -140,39 +142,22 @@ struct Templates {
             std::cerr << "Failed to open templates: " << path << std::endl;
             return false;
         }
-
         int32_t n;
         f.read(reinterpret_cast<char *>(&n), sizeof(int32_t));
-        if (n <= 0 || n > 10000) {
-            std::cerr << "Invalid template count: " << n << std::endl;
-            return false;
-        }
+        if (n <= 0 || n > 10000) return false;
 
         items.resize(n);
         for (int i = 0; i < n; i++) {
             int32_t nf;
             f.read(reinterpret_cast<char *>(&nf), sizeof(int32_t));
-            if (nf <= 0 || nf > 10000) {
-                std::cerr << "Invalid frame count for template " << i << ": " << nf << std::endl;
-                return false;
-            }
+            if (nf <= 0 || nf > 10000) return false;
             items[i].n_frames = nf;
             items[i].data.resize(nf * WHISPER_DIM);
             f.read(reinterpret_cast<char *>(items[i].data.data()), nf * WHISPER_DIM * sizeof(float));
         }
-
-        if (f.fail()) {
-            std::cerr << "Failed to read template data" << std::endl;
-            return false;
-        }
-
-        int total_frames = 0;
-        for (const auto &t : items) total_frames += t.n_frames;
-        std::cout << "Loaded " << n << " templates (" << total_frames << " total frames)" << std::endl;
-        return true;
+        return !f.fail();
     }
 
-    // Pre-compute inverse norms for input frames (call once per cycle).
     static void compute_inv_norms(const float *input, int n_frames, std::vector<float> &inv_norms) {
         inv_norms.resize(n_frames);
         for (int i = 0; i < n_frames; i++) {
@@ -183,16 +168,13 @@ struct Templates {
         }
     }
 
-    // Dot product with pre-normalized template vector, scaled by pre-computed input inv norm.
     static float cosine_dot(const float *a, const float *b_unit, float inv_norm_a) {
         float dot = 0;
         for (int i = 0; i < WHISPER_DIM; i++) dot += a[i] * b_unit[i];
         return dot * inv_norm_a;
     }
 
-    // Subsequence DTW: find the best-matching region within the input for the template.
-    // The template must be fully matched, but the match can start/end anywhere in input.
-    // Uses two-row sliding window instead of full matrix.
+    // Subsequence DTW: template must fully match, can start/end anywhere in input.
     static float subdtw(const float *input, int n_input,
                         const Template &tmpl,
                         const std::vector<float> &inv_norms,
@@ -201,10 +183,8 @@ struct Templates {
         int n_tmpl = tmpl.n_frames;
         prev_row.resize(n_tmpl + 1);
         curr_row.resize(n_tmpl + 1);
-
         std::fill(prev_row.begin(), prev_row.end(), 1e30f);
         prev_row[0] = 0.0f;
-
         float best = 1e30f;
 
         for (int i = 1; i <= n_input; i++) {
@@ -222,15 +202,12 @@ struct Templates {
             if (curr_row[n_tmpl] < best) best = curr_row[n_tmpl];
             std::swap(prev_row, curr_row);
         }
-
         return best / n_tmpl;
     }
 
-    // Best match across all templates. Returns similarity (1 - normalized_dtw_cost).
     float match(const float *input, int n_frames,
-                std::vector<float> &inv_norms,
+                const std::vector<float> &inv_norms,
                 std::vector<float> &row_a, std::vector<float> &row_b) const {
-        compute_inv_norms(input, n_frames, inv_norms);
         float best_sim = -1.0f;
         for (const auto &tmpl : items) {
             float cost = subdtw(input, n_frames, tmpl, inv_norms, row_a, row_b);
@@ -241,145 +218,200 @@ struct Templates {
     }
 };
 
-// ---- Main ----
+// ---- Jarvis implementation ----
 
-static void print_usage(const char *prog) {
-    std::cerr << "Usage: " << prog << " [options]\n"
-              << "  -m <path>   Whisper model (default: models/ggml-tiny.bin)\n"
-              << "  -e <path>   Enrolled templates (default: models/templates.bin)\n"
-              << "  -t <float>  DTW similarity threshold (default: " << DEFAULT_THRESHOLD << ")\n"
-              << "  -c <cmd>    Command to run on detection\n"
-              << "  -h          Show this help\n";
+struct LoadedKeyword {
+    Keyword config;
+    Templates templates;
+};
+
+struct Jarvis::Impl {
+    struct whisper_context *ctx = nullptr;
+    std::vector<LoadedKeyword> keywords;
+};
+
+Jarvis::Jarvis(const std::string &whisper_model) : impl(std::make_unique<Impl>()) {
+    struct whisper_context_params cparams = whisper_context_default_params();
+    cparams.use_gpu = false;
+    impl->ctx = whisper_init_from_file_with_params(whisper_model.c_str(), cparams);
+    if (!impl->ctx) {
+        throw std::runtime_error("Failed to load whisper model: " + whisper_model);
+    }
+    std::cout << "Whisper loaded: " << whisper_model << std::endl;
 }
 
-int main(int argc, char **argv) {
-    std::string whisper_path   = "models/ggml-tiny.bin";
-    std::string templates_path = "models/templates.bin";
-    std::string on_detect;
-    float threshold = DEFAULT_THRESHOLD;
+Jarvis::~Jarvis() {
+    if (impl && impl->ctx) whisper_free(impl->ctx);
+}
 
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "-m" && i + 1 < argc) whisper_path = argv[++i];
-        else if (arg == "-e" && i + 1 < argc) templates_path = argv[++i];
-        else if (arg == "-t" && i + 1 < argc) threshold = std::stof(argv[++i]);
-        else if (arg == "-c" && i + 1 < argc) on_detect = argv[++i];
-        else { print_usage(argv[0]); return 1; }
+void Jarvis::add_keyword(Keyword kw) {
+    LoadedKeyword lk;
+    lk.config = std::move(kw);
+    if (!lk.templates.load(lk.config.template_path)) {
+        throw std::runtime_error("Failed to load templates: " + lk.config.template_path);
+    }
+    int total = 0;
+    for (const auto &t : lk.templates.items) total += t.n_frames;
+    std::cout << "  " << lk.config.name << ": "
+              << lk.templates.items.size() << " template(s), " << total << " frames"
+              << (lk.config.callback ? " [callback]" : "") << std::endl;
+    impl->keywords.push_back(std::move(lk));
+}
+
+void Jarvis::stop() {
+    g_running = false;
+}
+
+void Jarvis::listen() {
+    if (impl->keywords.empty()) {
+        std::cerr << "No keywords registered" << std::endl;
+        return;
     }
 
     std::signal(SIGINT, signal_handler);
-    std::signal(SIGCHLD, SIG_IGN);  // auto-reap child processes
+    std::signal(SIGCHLD, SIG_IGN);
+    g_running = true;
 
-    // Load whisper
-    struct whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu = false;
-    struct whisper_context *ctx = whisper_init_from_file_with_params(
-        whisper_path.c_str(), cparams);
-    if (!ctx) {
-        std::cerr << "Failed to load whisper: " << whisper_path << std::endl;
-        return 1;
-    }
-    std::cout << "Whisper loaded: " << whisper_path << std::endl;
-
-    // Load templates
-    Templates templates;
-    if (!templates.load(templates_path)) {
-        whisper_free(ctx);
-        return 1;
-    }
-
-    // Init audio
     const int buffer_samples = static_cast<int>(BUFFER_SEC * SAMPLE_RATE);
     auto audio = std::make_shared<audio_async>(static_cast<int>(BUFFER_SEC * 1000));
     audio->init(-1, SAMPLE_RATE);
     audio->resume();
-    audio->clear();
 
-    std::cout << "Listening... (threshold=" << threshold << ", Ctrl+C to stop)" << std::endl;
+    std::cout << "Listening... (" << impl->keywords.size() << " keyword(s), Ctrl+C to stop)" << std::endl;
 
     const int max_encoder_frames = (buffer_samples / MEL_HOP + 1) / CONV_STRIDE + 1;
     const int max_encoder_floats = max_encoder_frames * WHISPER_DIM;
     std::vector<float> encoder_output(max_encoder_floats);
-    std::vector<float> inv_norms;             // pre-computed input frame inverse norms
-    std::vector<float> dtw_row_a, dtw_row_b;  // reusable DTW row buffers
+    std::vector<float> inv_norms;
+    std::vector<float> dtw_row_a, dtw_row_b;
     std::vector<float> pcm_buffer;
     pcm_buffer.reserve(buffer_samples);
 
     int refractory = 0;
-    const int refractory_cycles = 10;  // 10 * SLIDE_MS = 2 seconds
+    int refractory_total = 0;
+    float default_thr = impl->keywords[0].config.threshold;
 
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(SLIDE_MS));
 
         if (refractory > 0) {
+            float frac = (float)refractory / refractory_total;
+            render_bar("cooldown", frac, 1.0f, 0, true);
             refractory--;
-            audio->clear();
             continue;
         }
 
         audio->get(static_cast<int>(BUFFER_SEC * 1000), pcm_buffer);
-        if ((int)pcm_buffer.size() < buffer_samples / 2) continue;
+        if (pcm_buffer.empty()) continue;
 
-        // Energy-based VAD
+        // Energy-based VAD (computed before zero-padding to avoid dilution)
         float energy = 0;
         for (auto s : pcm_buffer) energy += s * s;
         energy /= pcm_buffer.size();
         if (energy < 1e-6f) {
-            render_bar(0.0f, threshold, 0, true);
+            render_bar("", 0.0f, default_thr, 0, true);
             continue;
         }
 
-        // Whisper mel + encode (variable-length: only encode actual audio frames)
-        auto t0 = std::chrono::steady_clock::now();
-        if (whisper_pcm_to_mel(ctx, pcm_buffer.data(), pcm_buffer.size(), 1) != 0) continue;
+        // Zero-pad short buffers so whisper gets a full-length input
+        if ((int)pcm_buffer.size() < buffer_samples)
+            pcm_buffer.resize(buffer_samples, 0.0f);
 
-        int mel_frames = whisper_n_len(ctx);
+        // Whisper mel + encode
+        auto t0 = std::chrono::steady_clock::now();
+        if (whisper_pcm_to_mel(impl->ctx, pcm_buffer.data(), pcm_buffer.size(), 1) != 0) {
+            render_bar("", 0.0f, default_thr, 0, true);
+            continue;
+        }
+
+        int mel_frames = whisper_n_len(impl->ctx);
         int actual_frames = (mel_frames + 1) / CONV_STRIDE;
         if (actual_frames <= 0) actual_frames = 1;
-        whisper_set_audio_ctx(ctx, actual_frames);
+        whisper_set_audio_ctx(impl->ctx, actual_frames);
 
-        if (whisper_encode(ctx, 0, 1) != 0) continue;
+        if (whisper_encode(impl->ctx, 0, 1) != 0) {
+            render_bar("", 0.0f, default_thr, 0, true);
+            continue;
+        }
 
-        int n_floats = whisper_encoder_output(ctx, encoder_output.data(), max_encoder_floats);
-        if (n_floats <= 0) continue;
+        int n_floats = whisper_encoder_output(impl->ctx, encoder_output.data(), max_encoder_floats);
+        if (n_floats <= 0) {
+            render_bar("", 0.0f, default_thr, 0, true);
+            continue;
+        }
         int n_enc_frames = n_floats / WHISPER_DIM;
 
         float *enc_ptr = encoder_output.data() + ONSET_SKIP * WHISPER_DIM;
         n_enc_frames -= ONSET_SKIP;
-        if (n_enc_frames <= 0) continue;
+        if (n_enc_frames <= 0) {
+            render_bar("", 0.0f, default_thr, 0, true);
+            continue;
+        }
         apply_cmvn(enc_ptr, n_enc_frames);
 
-        // DTW match against templates
-        float score = templates.match(enc_ptr, n_enc_frames, inv_norms, dtw_row_a, dtw_row_b);
+        // Pre-compute input inverse norms once (shared across all keywords)
+        Templates::compute_inv_norms(enc_ptr, n_enc_frames, inv_norms);
+
+        // Match each keyword against its own threshold
+        int fired_kw = -1;
+        float fired_score = 0;
+        int best_kw = 0;
+        float best_score = -1.0f;
+        for (int k = 0; k < (int)impl->keywords.size(); k++) {
+            float score = impl->keywords[k].templates.match(
+                enc_ptr, n_enc_frames, inv_norms, dtw_row_a, dtw_row_b);
+            if (score > best_score) {
+                best_score = score;
+                best_kw = k;
+            }
+            if (fired_kw < 0 && score >= impl->keywords[k].config.threshold) {
+                fired_kw = k;
+                fired_score = score;
+            }
+        }
+
         auto t1 = std::chrono::steady_clock::now();
         int total_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-        render_bar(score, threshold, total_ms, false);
+        int show_kw = fired_kw >= 0 ? fired_kw : best_kw;
+        float show_score = fired_kw >= 0 ? fired_score : best_score;
+        render_bar(impl->keywords[show_kw].config.name.c_str(), show_score,
+                   impl->keywords[show_kw].config.threshold, total_ms, false);
 
-        if (score >= threshold) {
+        if (fired_kw >= 0) {
+            const auto &kw = impl->keywords[fired_kw];
+
             auto now = std::chrono::system_clock::now();
-            auto t = std::chrono::system_clock::to_time_t(now);
+            auto tt = std::chrono::system_clock::to_time_t(now);
             char time_buf[32];
-            std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&t));
+            std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&tt));
             std::cerr << "\r\033[K" << std::flush;
-            std::cout << "  [" << time_buf << "] DETECTED  sim=" << score << std::endl;
+            std::cout << "  [" << time_buf << "] " << kw.config.name
+                      << "  sim=" << fired_score << std::endl;
 
-            if (!on_detect.empty()) {
-                pid_t pid = fork();
-                if (pid == 0) {
-                    execl("/bin/sh", "sh", "-c", on_detect.c_str(), nullptr);
-                    _exit(127);
-                } else if (pid < 0) {
-                    perror("fork");
-                }
+            if (kw.config.callback) {
+                kw.config.callback(kw.config.name, fired_score);
             }
 
             audio->clear();
-            refractory = refractory_cycles;
+            refractory_total = kw.config.refractory_ms / SLIDE_MS;
+            refractory = refractory_total;
         }
     }
 
-    whisper_free(ctx);
     std::cout << "\nStopped." << std::endl;
-    return 0;
+}
+
+// ---- run_command helper ----
+
+std::function<void(const std::string &, float)> run_command(const std::string &cmd) {
+    return [cmd](const std::string &, float) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
+            _exit(127);
+        } else if (pid < 0) {
+            perror("fork");
+        }
+    };
 }

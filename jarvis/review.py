@@ -4,7 +4,7 @@
     uv run python -m jarvis.review
 
 Opens a browser to record wake words, upload audio files, review/delete clips,
-and build templates for the C++ runtime.
+and build templates for the C++ runtime.  Supports multiple keywords.
 """
 
 import io
@@ -17,7 +17,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from jarvis import CLIPS_DIR
+from jarvis import CLIPS_DIR, keyword_name, list_keyword_dirs
 
 PORT = 8457
 
@@ -50,6 +50,11 @@ HTML = r"""<!DOCTYPE html>
   .wake-word { display: flex; align-items: center; gap: 8px; margin: 20px 0 16px; }
   .wake-word input { background: #16213e; color: #eee; border: 1px solid #333;
                      padding: 6px 12px; border-radius: 4px; font-size: 1em; width: 180px; }
+  .kw-list { display: flex; gap: 6px; flex-wrap: wrap; }
+  .kw-tag { background: #0f3460; color: #eee; padding: 4px 10px; border-radius: 4px;
+            font-size: 0.85em; cursor: pointer; border: 1px solid transparent; }
+  .kw-tag:hover { border-color: #e94560; }
+  .kw-tag.active { border-color: #e94560; background: #1a4a7a; }
 
   /* Record */
   .record-row { display: flex; align-items: center; gap: 16px; margin: 12px 0; }
@@ -112,8 +117,10 @@ HTML = r"""<!DOCTYPE html>
 
 <div class="wake-word">
   <span>Wake word:</span>
-  <input type="text" id="ww" value="hey jarvis" spellcheck="false">
+  <input type="text" id="ww" value="hey jarvis" spellcheck="false"
+         onchange="onWakeWordChange()" onkeydown="if(event.key==='Enter')onWakeWordChange()">
 </div>
+<div class="kw-list" id="kw-list"></div>
 
 <div class="record-row">
   <button class="rec-btn" id="rec-btn" onclick="toggleRec()"><div class="dot"></div></button>
@@ -136,7 +143,7 @@ HTML = r"""<!DOCTYPE html>
   <span class="count" id="count"></span>
   <div class="actions">
     <button class="btn" onclick="playAll()">Play All</button>
-    <button class="btn primary" id="build-btn" onclick="build()">Build Templates</button>
+    <button class="btn primary" id="build-btn" onclick="build()">Build All Templates</button>
   </div>
 </div>
 <div id="clips"></div>
@@ -146,7 +153,23 @@ HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let rec = null, chunks = [], timer = null, t0 = 0;
 
+function kwName() { return $('ww').value.toLowerCase().trim().replace(/\s+/g, '_').replace(/[^\w]/g, ''); }
 function st(el, msg, cls) { el.textContent = msg; el.className = 'status vis ' + cls; }
+
+// ---- Keyword tabs ----
+async function loadKeywords() {
+  const kws = await (await fetch('/api/keywords')).json();
+  const el = $('kw-list');
+  const cur = kwName();
+  el.innerHTML = kws.map(k =>
+    `<span class="kw-tag${k === cur ? ' active' : ''}" onclick="selectKw('${k}')">${k}</span>`
+  ).join('');
+}
+function selectKw(kw) {
+  $('ww').value = kw.replace(/_/g, ' ');
+  onWakeWordChange();
+}
+function onWakeWordChange() { load(); loadKeywords(); }
 
 // ---- Record ----
 async function toggleRec() {
@@ -198,15 +221,16 @@ async function process(blob, name) {
     const d = await r.json();
     if (d.error) st($('st'), d.error, 'err');
     else if (!d.n_clips) st($('st'), 'No wake words found in audio', 'err');
-    else { st($('st'), 'Extracted ' + d.n_clips + ' clip(s)', 'ok'); load(); }
+    else { st($('st'), 'Extracted ' + d.n_clips + ' clip(s)', 'ok'); load(); loadKeywords(); }
   } catch(e) { st($('st'), e.message, 'err'); }
 }
 
 // ---- Clips ----
 async function load() {
-  const clips = await (await fetch('/api/clips')).json();
+  const kw = kwName();
+  const clips = await (await fetch('/api/clips?keyword=' + encodeURIComponent(kw))).json();
   const el = $('clips');
-  $('count').textContent = clips.length + ' clips';
+  $('count').textContent = clips.length + ' clips (' + kw + ')';
   $('build-btn').disabled = !clips.length;
   if (!clips.length) { el.innerHTML = '<div class="empty">No clips yet. Record or upload audio above.</div>'; return; }
   let html = '', prev = 0, sn = 0;
@@ -217,17 +241,18 @@ async function load() {
     prev = c.mtime;
     html += `<div class="clip" id="r-${c.name}">
       <span class="name">${c.name}</span><span class="dur">${c.duration}s</span>
-      <audio controls preload="metadata" src="/clip/${c.name}"></audio>
+      <audio controls preload="metadata" src="/clip/${kw}/${c.name}"></audio>
       <button class="del" onclick="del_('${c.name}')">delete</button></div>`;
   }
   el.innerHTML = html;
 }
 async function del_(name) {
   if (!confirm('Delete ' + name + '?')) return;
-  await fetch('/api/delete?name=' + encodeURIComponent(name), {method:'POST'});
+  const kw = kwName();
+  await fetch('/api/delete?keyword=' + encodeURIComponent(kw) + '&name=' + encodeURIComponent(name), {method:'POST'});
   const row = $('r-'+name); if (row) row.remove();
   const n = document.querySelectorAll('.clip').length;
-  $('count').textContent = n + ' clips';
+  $('count').textContent = n + ' clips (' + kw + ')';
   $('build-btn').disabled = !n;
 }
 async function playAll() {
@@ -247,6 +272,7 @@ async function build() {
 }
 
 load();
+loadKeywords();
 </script>
 </body>
 </html>"""
@@ -257,13 +283,21 @@ class Handler(SimpleHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        p = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        p = parsed.path
         if p in ("", "/"):
             self._html(HTML)
         elif p == "/api/clips":
-            self._clips()
+            self._clips(parsed)
+        elif p == "/api/keywords":
+            self._keywords()
         elif p.startswith("/clip/"):
-            self._serve_clip(p[6:])
+            # /clip/<keyword>/<filename>
+            parts = p[6:].split("/", 1)
+            if len(parts) == 2:
+                self._serve_clip(parts[0], parts[1])
+            else:
+                self.send_error(404)
         else:
             self.send_error(404)
 
@@ -299,18 +333,35 @@ class Handler(SimpleHTTPRequestHandler):
 
     # --- GET handlers ---
 
-    def _clips(self):
+    @staticmethod
+    def _safe_clip_path(kw: str, name: str) -> Path | None:
+        """Resolve a clip path, returning None if it escapes CLIPS_DIR."""
+        kw_dir = CLIPS_DIR / kw
+        fpath = kw_dir / name
+        if (fpath.exists()
+                and fpath.resolve().parent == kw_dir.resolve()
+                and kw_dir.resolve().parent == CLIPS_DIR.resolve()):
+            return fpath
+        return None
+
+    def _keywords(self):
+        self._json([d.name for d in list_keyword_dirs()])
+
+    def _clips(self, parsed):
+        qs = parse_qs(parsed.query)
+        kw = qs.get("keyword", ["hey_jarvis"])[0]
+        kw_dir = CLIPS_DIR / kw
         clips = []
-        if CLIPS_DIR.exists():
-            for f in sorted(CLIPS_DIR.glob("*.wav")):
+        if kw_dir.exists() and kw_dir.resolve().parent == CLIPS_DIR.resolve():
+            for f in sorted(kw_dir.glob("*.wav")):
                 with wave.open(str(f), "rb") as wf:
                     dur = round(wf.getnframes() / wf.getframerate(), 1)
                 clips.append({"name": f.name, "duration": dur, "mtime": f.stat().st_mtime})
         self._json(clips)
 
-    def _serve_clip(self, name):
-        fpath = CLIPS_DIR / name
-        if fpath.exists() and fpath.resolve().parent == CLIPS_DIR.resolve():
+    def _serve_clip(self, kw, name):
+        fpath = self._safe_clip_path(kw, name)
+        if fpath:
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
             self.end_headers()
@@ -322,9 +373,10 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _delete(self, parsed):
         qs = parse_qs(parsed.query)
+        kw = qs.get("keyword", ["hey_jarvis"])[0]
         name = qs.get("name", [""])[0]
-        fpath = CLIPS_DIR / name
-        if fpath.exists() and fpath.resolve().parent == CLIPS_DIR.resolve() and name.endswith(".wav"):
+        fpath = self._safe_clip_path(kw, name)
+        if fpath and name.endswith(".wav"):
             fpath.unlink()
             self._json({"ok": True})
         else:
@@ -348,14 +400,16 @@ class Handler(SimpleHTTPRequestHandler):
 
         try:
             model = _get_labeler()
-            wake_words = self.headers.get("X-Wake-Words", "hey jarvis").lower().split()
+            wake_phrase = self.headers.get("X-Wake-Words", "hey jarvis")
+            wake_words = wake_phrase.lower().split()
+            kw = keyword_name(wake_phrase)
 
             clips = process_audio(tmp_path, model, wake_words)
             if not clips:
                 self._json({"n_clips": 0})
                 return
 
-            new_paths = save_clips(clips)
+            new_paths = save_clips(clips, kw)
             self._json({"n_clips": len(new_paths), "clips": [p.name for p in new_paths]})
         except Exception as e:
             self._json({"error": str(e)})
@@ -377,9 +431,17 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
-    clips = list(CLIPS_DIR.glob("*.wav")) if CLIPS_DIR.exists() else []
+    total_clips = 0
+    keywords = []
+    for d in list_keyword_dirs():
+        n = len(list(d.glob("*.wav")))
+        keywords.append(f"{d.name} ({n})")
+        total_clips += n
     print(f"Jarvis Enrollment UI")
-    print(f"  {len(clips)} clips in {CLIPS_DIR}/")
+    if keywords:
+        print(f"  {total_clips} clips: {', '.join(keywords)}")
+    else:
+        print(f"  No clips yet")
     print(f"  http://localhost:{PORT}")
     webbrowser.open(f"http://localhost:{PORT}")
     HTTPServer(("", PORT), Handler).serve_forever()
