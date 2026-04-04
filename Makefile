@@ -1,17 +1,23 @@
+build/jarvis: src/*.cpp src/*.h src/*.hpp lib/ggml/src/**/*.c lib/ggml/src/**/*.cpp CMakeLists.txt
+	@cmake -B build -DCMAKE_BUILD_TYPE=Release > /dev/null
+	@cmake --build build -j$$(nproc)
+
+run: build/jarvis
+	./build/jarvis
+
+run-detect: build/jarvis
+	./build/jarvis --detect-only
+
 enroll:
 	uv run python -m jarvis.enroll
+
+templates:
+	uv run python -m jarvis.enroll --build
 
 review:
 	uv run python -m jarvis.review
 
-build:
-	uv run python -m jarvis.enroll --build
+clean:
+	rm -rf build
 
-run:
-	./build/jarvis
-
-compile:
-	cmake -B build -DCMAKE_BUILD_TYPE=Release
-	cmake --build build -j$$(nproc)
-
-.PHONY: enroll review build run compile
+.PHONY: run run-detect enroll templates review clean

@@ -678,6 +678,10 @@ extern "C" {
     // Pass 0 to reset to default. Value is ceil(mel_frames / 2).
     WHISPER_API void whisper_set_audio_ctx(struct whisper_context * ctx, int n_audio_ctx);
 
+    // Skip cross-attention KV pre-computation (encoder-only mode).
+    // Call after init to avoid computing decoder cross-attention keys/values.
+    WHISPER_API void whisper_set_encoder_only(struct whisper_context * ctx, bool encoder_only);
+
 #ifdef __cplusplus
 }
 #endif

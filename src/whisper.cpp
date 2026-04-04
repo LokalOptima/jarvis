@@ -17,6 +17,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cassert>
+#include <cfloat>
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <cstdio>
@@ -833,6 +834,21 @@ struct whisper_state {
 
     // [EXPERIMENTAL] speed-up techniques
     int32_t exp_n_audio_ctx = 0; // 0 - use default
+    bool skip_cross = false;     // skip cross-attention KV pre-computation (encoder-only mode)
+
+    // ggml-accelerated mel spectrogram
+    whisper_sched sched_mel;
+    struct ggml_tensor * mel_dft_cos = nullptr;  // (n_fft_bins, frame_size) DFT cosine basis
+    struct ggml_tensor * mel_dft_sin = nullptr;  // (n_fft_bins, frame_size) DFT sine basis
+    struct ggml_tensor * mel_filters_tensor = nullptr;  // (n_mel, n_fft_bins) mel filterbank
+    ggml_backend_buffer_t mel_basis_buffer = nullptr;
+    std::vector<uint8_t> mel_basis_ctx_buf;  // keeps tensor metadata alive after ggml_free
+    int mel_n_frames = 0;  // number of frames for current buffer size
+
+    // Pre-allocated buffers for mel spectrogram (avoid per-call heap alloc)
+    std::vector<float> mel_samples_padded;
+    std::vector<float> mel_frames_buf;
+    std::vector<float> mel_raw_buf;
 };
 
 struct whisper_context {
@@ -1554,6 +1570,56 @@ static bool whisper_encode_external(const whisper_state & wstate) {
     return use_coreml || use_openvino;
 }
 
+// Build ggml graph for mel spectrogram: DFT via matmul + filterbank
+//
+// Input:  windowed_frames (frame_size, n_frames) — Hann-windowed audio frames
+// Output: mel_out (n_mel, n_frames) — log mel spectrogram
+//
+// Graph:  re = dft_cos @ frames     (n_fft_bins, n_frames)
+//         im = dft_sin @ frames     (n_fft_bins, n_frames)
+//         power = re*re + im*im     (n_fft_bins, n_frames)
+//         mel = filters @ power     (n_mel, n_frames)
+//         mel = log(max(mel, 1e-10))
+static struct ggml_cgraph * whisper_build_graph_mel(
+        whisper_context & wctx,
+          whisper_state & wstate) {
+    const int n_fft_bins  = wctx.model.filters.n_fft;  // 201
+    const int frame_size  = WHISPER_N_FFT;              // 400
+    const int n_mel       = wctx.model.filters.n_mel;   // 80
+    const int n_frames    = wstate.mel_n_frames;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ wstate.sched_mel.meta.size(),
+        /*.mem_buffer =*/ wstate.sched_mel.meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+    struct ggml_tensor * frames = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, frame_size, n_frames);
+    ggml_set_name(frames, "mel_frames");
+    ggml_set_input(frames);
+
+    struct ggml_tensor * re = ggml_mul_mat(ctx0, wstate.mel_dft_cos, frames);
+    struct ggml_tensor * im = ggml_mul_mat(ctx0, wstate.mel_dft_sin, frames);
+
+    struct ggml_tensor * power = ggml_add(ctx0, ggml_mul(ctx0, re, re), ggml_mul(ctx0, im, im));
+
+    struct ggml_tensor * mel_raw = ggml_mul_mat(ctx0, wstate.mel_filters_tensor, power);
+
+    // raw log10 mel; whisper-specific dynamic range compression applied post-graph
+    struct ggml_tensor * mel_out = ggml_scale(ctx0, ggml_log(ctx0, ggml_clamp(ctx0, mel_raw, 1e-10f, FLT_MAX)), 1.0f / logf(10.0f));
+
+    ggml_set_name(mel_out, "mel_out");
+    ggml_set_output(mel_out);
+
+    ggml_build_forward_expand(gf, mel_out);
+    ggml_free(ctx0);
+
+    return gf;
+}
+
 static struct ggml_cgraph * whisper_build_graph_conv(
         whisper_context & wctx,
           whisper_state & wstate) {
@@ -1995,7 +2061,6 @@ static bool whisper_encode_internal(
 #endif
         }
     }
-
     // encoder
     if (!whisper_encode_external(wstate)) {
         auto & sched = wstate.sched_encode.sched;
@@ -2011,9 +2076,8 @@ static bool whisper_encode_internal(
             return false;
         }
     }
-
-    // cross
-    {
+    // cross — only needed for decoding, skip if not requested
+    if (!wstate.skip_cross) {
         auto & sched = wstate.sched_cross.sched;
 
         ggml_cgraph * gf = whisper_build_graph_cross(wctx, wstate);
@@ -2038,257 +2102,115 @@ static bool whisper_encode_internal(
 // Mel spectrogram
 //
 
-#define SIN_COS_N_COUNT WHISPER_N_FFT
 namespace {
 struct whisper_global_cache {
-    // In FFT, we frequently use sine and cosine operations with the same values.
-    // We can use precalculated values to speed up the process.
-    float sin_vals[SIN_COS_N_COUNT];
-    float cos_vals[SIN_COS_N_COUNT];
-
     // Hann window (Use cosf to eliminate difference)
     // ref: https://pytorch.org/docs/stable/generated/torch.hann_window.html
     // ref: https://github.com/openai/whisper/blob/main/whisper/audio.py#L147
     float hann_window[WHISPER_N_FFT];
 
     whisper_global_cache() {
-        fill_sin_cos_table();
-        fill_hann_window(sizeof(hann_window)/sizeof(hann_window[0]), true, hann_window);
-    }
-
-    void fill_sin_cos_table() {
-        for (int i = 0; i < SIN_COS_N_COUNT; i++) {
-            double theta = (2 * M_PI * i) / SIN_COS_N_COUNT;
-            sin_vals[i] = sinf(theta);
-            cos_vals[i] = cosf(theta);
-        }
-    }
-
-    void fill_hann_window(int length, bool periodic, float * output) {
-        int offset = -1;
-        if (periodic) {
-            offset = 0;
-        }
-        for (int i = 0; i < length; i++) {
-            output[i] = 0.5 * (1.0 - cosf((2.0 * M_PI * i) / (length + offset)));
+        for (int i = 0; i < WHISPER_N_FFT; i++) {
+            hann_window[i] = 0.5f * (1.0f - cosf((2.0f * (float)M_PI * i) / WHISPER_N_FFT));
         }
     }
 } global_cache;
 }
 
-// naive Discrete Fourier Transform
-// input is real-valued
-// output is complex-valued
-static void dft(const float* in, int N, float* out) {
-    const int sin_cos_step = SIN_COS_N_COUNT / N;
-
-    for (int k = 0; k < N; k++) {
-        float re = 0;
-        float im = 0;
-
-        for (int n = 0; n < N; n++) {
-            int idx = (k * n * sin_cos_step) % (SIN_COS_N_COUNT); // t = 2*M_PI*k*n/N
-            re += in[n]*global_cache.cos_vals[idx]; // cos(t)
-            im -= in[n]*global_cache.sin_vals[idx]; // sin(t)
-        }
-
-        out[k*2 + 0] = re;
-        out[k*2 + 1] = im;
-    }
-}
-
-// Cooley-Tukey FFT
-// poor man's implementation - use something better
-// input is real-valued
-// output is complex-valued
-static void fft(float* in, int N, float* out) {
-    if (N == 1) {
-        out[0] = in[0];
-        out[1] = 0;
-        return;
-    }
-
-    const int half_N = N / 2;
-    if (N - half_N*2 == 1) {
-        dft(in, N, out);
-        return;
-    }
-
-    float* even = in + N;
-    for (int i = 0; i < half_N; ++i) {
-        even[i]= in[2*i];
-    }
-    float* even_fft = out + 2 * N;
-    fft(even, half_N, even_fft);
-
-    float* odd = even;
-    for (int i = 0; i < half_N; ++i) {
-        odd[i] = in[2*i + 1];
-    }
-    float* odd_fft = even_fft + N;
-    fft(odd, half_N, odd_fft);
-
-    const int sin_cos_step = SIN_COS_N_COUNT / N;
-    for (int k = 0; k < half_N; k++) {
-        int idx = k * sin_cos_step; // t = 2*M_PI*k/N
-        float re = global_cache.cos_vals[idx]; // cos(t)
-        float im = -global_cache.sin_vals[idx]; // sin(t)
-
-        float re_odd = odd_fft[2*k + 0];
-        float im_odd = odd_fft[2*k + 1];
-
-        out[2*k + 0] = even_fft[2*k + 0] + re*re_odd - im*im_odd;
-        out[2*k + 1] = even_fft[2*k + 1] + re*im_odd + im*re_odd;
-
-        out[2*(k + half_N) + 0] = even_fft[2*k + 0] - re*re_odd + im*im_odd;
-        out[2*(k + half_N) + 1] = even_fft[2*k + 1] - re*im_odd - im*re_odd;
-    }
-}
-
-static void log_mel_spectrogram_worker_thread(int ith, const float * hann, const std::vector<float> & samples,
-                                              int n_samples, int frame_size, int frame_step, int n_threads,
-                                              const whisper_filters & filters, whisper_mel & mel) {
-    std::vector<float> fft_in(frame_size * 2, 0.0);
-    std::vector<float> fft_out(frame_size * 2 * 2 * 2);
-
-    int n_fft = filters.n_fft;
-    int i = ith;
-
-    // make sure n_fft == 1 + (WHISPER_N_FFT / 2), bin_0 to bin_nyquist
-    assert(n_fft == 1 + (frame_size / 2));
-
-    // calculate FFT only when fft_in are not all zero
-    for (; i < std::min(n_samples / frame_step + 1, mel.n_len); i += n_threads) {
-        const int offset = i * frame_step;
-
-        // apply Hann window (~10% faster)
-        for (int j = 0; j < std::min(frame_size, n_samples - offset); j++) {
-            fft_in[j] = hann[j] * samples[offset + j];
-        }
-
-        // fill the rest with zeros
-        if (n_samples - offset < frame_size) {
-            std::fill(fft_in.begin() + (n_samples - offset), fft_in.end(), 0.0);
-        }
-
-        // FFT
-        fft(fft_in.data(), frame_size, fft_out.data());
-
-        // Calculate modulus^2 of complex numbers
-        // Use pow(fft_out[2 * j + 0], 2) + pow(fft_out[2 * j + 1], 2) causes inference quality problem? Interesting.
-        for (int j = 0; j < n_fft; j++) {
-            fft_out[j] = (fft_out[2 * j + 0] * fft_out[2 * j + 0] + fft_out[2 * j + 1] * fft_out[2 * j + 1]);
-        }
-
-        // mel spectrogram
-        for (int j = 0; j < mel.n_mel; j++) {
-            double sum = 0.0;
-            // unroll loop (suggested by GH user @lunixbochs)
-            int k = 0;
-            for (k = 0; k < n_fft - 3; k += 4) {
-                sum +=
-                        fft_out[k + 0] * filters.data[j * n_fft + k + 0] +
-                        fft_out[k + 1] * filters.data[j * n_fft + k + 1] +
-                        fft_out[k + 2] * filters.data[j * n_fft + k + 2] +
-                        fft_out[k + 3] * filters.data[j * n_fft + k + 3];
-            }
-            // handle n_fft remainder
-            for (; k < n_fft; k++) {
-                sum += fft_out[k] * filters.data[j * n_fft + k];
-            }
-            sum = log10(std::max(sum, 1e-10));
-            mel.data[j * mel.n_len + i] = sum;
-        }
-    }
-
-    // Otherwise fft_out are all zero
-    double sum = log10(1e-10);
-    for (; i < mel.n_len; i += n_threads) {
-        for (int j = 0; j < mel.n_mel; j++) {
-            mel.data[j * mel.n_len + i] = sum;
-        }
-    }
-}
-
-// ref: https://github.com/openai/whisper/blob/main/whisper/audio.py#L110-L157
+// ggml-accelerated mel spectrogram: DFT via batched matmul + filterbank matmul.
+// Replaces the per-frame scalar FFT with three SIMD-optimized matmuls.
 static bool log_mel_spectrogram(
+              whisper_context & wctx,
               whisper_state & wstate,
               const float * samples,
               const int   n_samples,
-              const int   /*sample_rate*/,
-              const int   frame_size,
-              const int   frame_step,
-              const int   n_mel,
-              const int   n_threads,
-              const whisper_filters & filters,
-              const bool   debug,
-              whisper_mel & mel) {
+              const int   n_threads) {
     const int64_t t_start_us = ggml_time_us();
 
-    // Hann window
-    WHISPER_ASSERT(frame_size == WHISPER_N_FFT && "Unsupported frame_size");
-    const float * hann = global_cache.hann_window;
+    const int frame_size = WHISPER_N_FFT;
+    const int frame_step = WHISPER_HOP_LENGTH;
+    const int n_mel      = wctx.model.filters.n_mel;
+    const float * hann   = global_cache.hann_window;
 
-    // Reflective padding (half a frame on each side) for STFT edge handling
-    const int64_t pad = frame_size / 2;
+    // Reflective padding (left edge only, matching original whisper.cpp)
+    const int pad = frame_size / 2;
+    const int n_padded = n_samples + 2 * pad;
 
-    std::vector<float> samples_padded(n_samples + 2 * pad, 0.0f);
-    std::copy(samples, samples + n_samples, samples_padded.begin() + pad);
-    std::reverse_copy(samples + 1, samples + 1 + pad, samples_padded.begin());
+    auto & padded = wstate.mel_samples_padded;
+    padded.resize(n_padded);
+    std::reverse_copy(samples + 1, samples + 1 + pad, padded.begin());
+    std::copy(samples, samples + n_samples, padded.begin() + pad);
+    // Only the right-pad region needs zeroing (left pad + samples already written above)
+    std::fill(padded.begin() + pad + n_samples, padded.end(), 0.0f);
 
-    mel.n_mel     = n_mel;
-    mel.n_len     = (samples_padded.size() - frame_size) / frame_step;
-    mel.n_len_org = mel.n_len;
-    mel.data.resize(mel.n_mel * mel.n_len);
+    const int n_frames = (n_padded - frame_size) / frame_step;
 
-    {
-        std::vector<std::thread> workers(n_threads - 1);
-        for (int iw = 0; iw < n_threads - 1; ++iw) {
-            workers[iw] = std::thread(
-                    log_mel_spectrogram_worker_thread, iw + 1, hann, std::cref(samples_padded),
-                    n_samples + pad, frame_size, frame_step, n_threads,
-                    std::cref(filters), std::ref(mel));
+    wstate.mel.n_mel     = n_mel;
+    wstate.mel.n_len     = n_frames;
+    wstate.mel.n_len_org = n_frames;
+
+    // Build windowed frames matrix: each column is one Hann-windowed frame
+    auto & frames = wstate.mel_frames_buf;
+    frames.resize(frame_size * n_frames);
+    for (int i = 0; i < n_frames; i++) {
+        const int offset = i * frame_step;
+        float * col = frames.data() + i * frame_size;
+        const int valid = std::min(frame_size, n_samples + pad - offset);
+        for (int j = 0; j < valid; j++) {
+            col[j] = hann[j] * padded[offset + j];
         }
-
-        // main thread
-        log_mel_spectrogram_worker_thread(0, hann, samples_padded, n_samples + pad, frame_size, frame_step, n_threads, filters, mel);
-
-        for (int iw = 0; iw < n_threads - 1; ++iw) {
-            workers[iw].join();
-        }
-    }
-
-    // clamping and normalization
-    double mmax = -1e20;
-    for (int i = 0; i < mel.n_mel*mel.n_len; i++) {
-        if (mel.data[i] > mmax) {
-            mmax = mel.data[i];
+        for (int j = valid; j < frame_size; j++) {
+            col[j] = 0.0f;
         }
     }
 
-    mmax -= 8.0;
+    wstate.mel_n_frames = n_frames;
 
-    for (int i = 0; i < mel.n_mel*mel.n_len; i++) {
-        if (mel.data[i] < mmax) {
-            mel.data[i] = mmax;
+    auto & sched = wstate.sched_mel.sched;
+    ggml_backend_sched_reset(sched);
+
+    ggml_cgraph * gf = whisper_build_graph_mel(wctx, wstate);
+
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        WHISPER_LOG_ERROR("%s: failed to alloc mel graph\n", __func__);
+        return false;
+    }
+
+    struct ggml_tensor * frames_tensor = ggml_graph_get_tensor(gf, "mel_frames");
+    ggml_backend_tensor_set(frames_tensor, frames.data(), 0, frame_size * n_frames * sizeof(float));
+
+    if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        WHISPER_LOG_ERROR("%s: failed to compute mel graph\n", __func__);
+        return false;
+    }
+
+    // Transpose: ggml output is column-major (n_mel per frame),
+    // whisper expects row-major per mel bin: mel.data[bin * n_len + frame]
+    struct ggml_tensor * mel_out = ggml_graph_get_tensor(gf, "mel_out");
+    auto & raw = wstate.mel_raw_buf;
+    raw.resize(n_mel * n_frames);
+    ggml_backend_tensor_get(mel_out, raw.data(), 0, n_mel * n_frames * sizeof(float));
+
+    auto & mel = wstate.mel;
+    mel.data.resize(n_mel * n_frames);
+    // j-outer for sequential writes into mel.data
+    for (int j = 0; j < n_mel; j++) {
+        for (int i = 0; i < n_frames; i++) {
+            mel.data[j * n_frames + i] = raw[j + i * n_mel];
         }
+    }
 
-        mel.data[i] = (mel.data[i] + 4.0)/4.0;
+    // Dynamic range compression (whisper-specific): find max, clamp, normalize in one pass
+    float mmax = -1e20f;
+    for (int i = 0; i < n_mel * n_frames; i++) {
+        if (mel.data[i] > mmax) mmax = mel.data[i];
+    }
+    mmax -= 8.0f;
+    for (int i = 0; i < n_mel * n_frames; i++) {
+        mel.data[i] = (std::max(mel.data[i], mmax) + 4.0f) / 4.0f;
     }
 
     wstate.t_mel_us += ggml_time_us() - t_start_us;
-
-    // Dump log_mel_spectrogram
-    if (debug) {
-        std::ofstream outFile("log_mel_spectrogram.json");
-        outFile << "[";
-        for (uint64_t i = 0; i < mel.data.size() - 1; i++) {
-            outFile << mel.data[i] << ", ";
-        }
-        outFile << mel.data[mel.data.size() - 1] << "]";
-        outFile.close();
-    }
-
     return true;
 }
 
@@ -2403,6 +2325,87 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
 #endif
 
     state->batch = whisper_batch_init(ctx->model.hparams.n_text_ctx, WHISPER_MAX_DECODERS);
+
+    // ggml mel spectrogram: precompute DFT basis matrices and mel filterbank as ggml tensors
+    {
+        const int frame_size = WHISPER_N_FFT;       // 400
+        const int n_fft_bins = 1 + frame_size / 2;  // 201
+        const int n_mel = ctx->model.filters.n_mel;  // 80
+
+        // Determine n_frames for the expected buffer size.
+        // For a 2s buffer at 16kHz: 32000 + 400 (pad) samples, hop=160 → 200 frames.
+        // We use a generous upper bound; the graph handles any n_frames up to this.
+        const int max_samples = WHISPER_SAMPLE_RATE * 30 + frame_size;  // 30s max (whisper limit)
+        state->mel_n_frames = (max_samples - frame_size) / WHISPER_HOP_LENGTH;
+
+        // Create ggml context for the persistent basis tensors (3 tensors)
+        // The ctx_buf must outlive the ggml_context so tensor metadata persists
+        state->mel_basis_ctx_buf.resize(3 * ggml_tensor_overhead());
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ state->mel_basis_ctx_buf.size(),
+            /*.mem_buffer =*/ state->mel_basis_ctx_buf.data(),
+            /*.no_alloc   =*/ true,
+        };
+        struct ggml_context * ctx_basis = ggml_init(params);
+
+        // ggml_mul_mat(A, B) computes A^T @ B. To get (n_fft_bins, n_frames) output
+        // from input (frame_size, n_frames), A must be (frame_size, n_fft_bins).
+        state->mel_dft_cos = ggml_new_tensor_2d(ctx_basis, GGML_TYPE_F32, frame_size, n_fft_bins);
+        state->mel_dft_sin = ggml_new_tensor_2d(ctx_basis, GGML_TYPE_F32, frame_size, n_fft_bins);
+        // For filterbank: ggml_mul_mat(A, B) = A^T @ B. To get (n_mel, n_frames) from (n_fft_bins, n_frames),
+        // A must be (n_fft_bins, n_mel).
+        state->mel_filters_tensor = ggml_new_tensor_2d(ctx_basis, GGML_TYPE_F32, n_fft_bins, n_mel);
+
+        state->mel_basis_buffer = ggml_backend_alloc_ctx_tensors(ctx_basis, state->backends[0]);
+        if (!state->mel_basis_buffer) {
+            WHISPER_LOG_ERROR("%s: failed to allocate mel basis buffer\n", __func__);
+            whisper_free_state(state);
+            return nullptr;
+        }
+
+        // Fill DFT cosine basis: cos[k][n] = cos(2π·k·n/N) for k=0..n_fft_bins-1, n=0..frame_size-1
+        // Layout: (frame_size, n_fft_bins) row-major = for each k, frame_size values
+        {
+            std::vector<float> cos_data(n_fft_bins * frame_size);
+            std::vector<float> sin_data(n_fft_bins * frame_size);
+            for (int k = 0; k < n_fft_bins; k++) {
+                for (int n = 0; n < frame_size; n++) {
+                    double angle = 2.0 * M_PI * k * n / frame_size;
+                    cos_data[k * frame_size + n] =  (float)cos(angle);
+                    sin_data[k * frame_size + n] = -(float)sin(angle);  // negative for DFT convention
+                }
+            }
+            ggml_backend_tensor_set(state->mel_dft_cos, cos_data.data(), 0, cos_data.size() * sizeof(float));
+            ggml_backend_tensor_set(state->mel_dft_sin, sin_data.data(), 0, sin_data.size() * sizeof(float));
+        }
+
+        // Filterbank: same layout as model filters (n_mel, n_fft_bins) row-major
+        ggml_backend_tensor_set(state->mel_filters_tensor,
+            ctx->model.filters.data.data(), 0,
+            n_mel * n_fft_bins * sizeof(float));
+
+        ggml_free(ctx_basis);
+
+        WHISPER_LOG_INFO("%s: mel basis (DFT+filters) = %7.2f MB\n", __func__,
+                (ggml_nbytes(state->mel_dft_cos) + ggml_nbytes(state->mel_dft_sin) +
+                 ggml_nbytes(state->mel_filters_tensor)) / 1e6);
+    }
+
+    // mel spectrogram allocator
+    {
+        bool ok = whisper_sched_graph_init(state->sched_mel, state->backends,
+                [&]() {
+                    return whisper_build_graph_mel(*ctx, *state);
+                });
+
+        if (!ok) {
+            WHISPER_LOG_ERROR("%s: failed to init mel allocator\n", __func__);
+            whisper_free_state(state);
+            return nullptr;
+        }
+
+        WHISPER_LOG_INFO("%s: compute buffer (mel)    = %7.2f MB\n", __func__, whisper_sched_size(state->sched_mel) / 1e6);
+    }
 
     // conv allocator
     {
@@ -2733,9 +2736,11 @@ void whisper_free_state(struct whisper_state * state) {
 
         whisper_batch_free(state->batch);
 
+        ggml_backend_sched_free(state->sched_mel.sched);
         ggml_backend_sched_free(state->sched_conv.sched);
         ggml_backend_sched_free(state->sched_encode.sched);
         ggml_backend_sched_free(state->sched_cross.sched);
+        ggml_backend_buffer_free(state->mel_basis_buffer);
 
         for (auto & backend : state->backends) {
             ggml_backend_free(backend);
@@ -2761,7 +2766,7 @@ void whisper_free(struct whisper_context * ctx) {
 }
 
 int whisper_pcm_to_mel_with_state(struct whisper_context * ctx, struct whisper_state * state, const float * samples, int n_samples, int n_threads) {
-    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH, ctx->model.filters.n_mel, n_threads, ctx->model.filters, false, state->mel)) {
+    if (!log_mel_spectrogram(*ctx, *state, samples, n_samples, n_threads)) {
         WHISPER_LOG_ERROR("%s: failed to compute mel spectrogram\n", __func__);
         return -1;
     }
@@ -2855,5 +2860,11 @@ int whisper_encoder_output(struct whisper_context * ctx, float * output, int max
 void whisper_set_audio_ctx(struct whisper_context * ctx, int n_audio_ctx) {
     if (ctx && ctx->state) {
         ctx->state->exp_n_audio_ctx = n_audio_ctx;
+    }
+}
+
+void whisper_set_encoder_only(struct whisper_context * ctx, bool encoder_only) {
+    if (ctx && ctx->state) {
+        ctx->state->skip_cross = encoder_only;
     }
 }

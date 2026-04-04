@@ -237,6 +237,7 @@ Jarvis::Jarvis(const std::string &whisper_model) : impl(std::make_unique<Impl>()
     if (!impl->ctx) {
         throw std::runtime_error("Failed to load whisper model: " + whisper_model);
     }
+    whisper_set_encoder_only(impl->ctx, true);
     std::cout << "Whisper loaded: " << whisper_model << std::endl;
 }
 
@@ -276,6 +277,17 @@ void Jarvis::listen() {
     auto audio = std::make_shared<audio_async>(static_cast<int>(BUFFER_SEC * 1000));
     audio->init(-1, SAMPLE_RATE);
     audio->resume();
+
+    // Wait for the audio buffer to fill, showing progress
+    {
+        const int steps = 20;
+        const int step_ms = (int)(BUFFER_SEC * 1000) / steps;
+        for (int i = 1; i <= steps && g_running; i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+            render_bar("buffering", (float)i / steps, 1.0f, 0, true);
+        }
+        std::cerr << "\r\033[K" << std::flush;
+    }
 
     std::cout << "Listening... (" << impl->keywords.size() << " keyword(s), Ctrl+C to stop)" << std::endl;
 
