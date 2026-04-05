@@ -9,6 +9,7 @@
 
 #include "server.h"
 #include "net.h"
+#include "vad_ggml.h"
 #include "weather.hpp"
 #include "whisper.h"
 
@@ -78,6 +79,7 @@ static bool send_status(int fd, uint8_t status) {
 
 static void handle_client(int client_fd,
                           whisper_context *ctx,
+                          SileroVad &vad,
                           const std::vector<LoadedKeyword> &keywords)
 {
     RingBuffer ring;
@@ -133,10 +135,15 @@ static void handle_client(int client_fd,
             continue;
         }
 
+        // Run Silero VAD on incoming audio chunk
+        bool has_speech = false;
+        for (int i = 0; i + SileroVad::CHUNK_SAMPLES <= n_samples; i += SileroVad::CHUNK_SAMPLES) {
+            if (vad.process(samples + i) > 0.5f) has_speech = true;
+        }
+        if (!has_speech) continue;
+
         // Get the full 2s window
         ring.get_last(JARVIS_BUFFER_SAMPLES, pcm_window);
-
-        if (!vad_check(pcm_window.data(), pcm_window.size())) continue;
 
         DetectResult det = detect_once(ctx, keywords,
                                        pcm_window.data(), pcm_window.size(), scratch);
@@ -175,6 +182,7 @@ static void handle_client(int client_fd,
             }
 
             ring.clear();
+            vad.reset();
             refractory_total = kw.refractory_ms / JARVIS_SLIDE_MS;
             refractory = refractory_total;
         }
@@ -182,11 +190,20 @@ static void handle_client(int client_fd,
 }
 
 void jarvis_server(const std::string &model_path,
+                   const std::string &vad_model_path,
                    std::vector<LoadedKeyword> keywords,
                    int port)
 {
     std::signal(SIGINT, signal_handler);
     g_running = true;
+
+    // Load Silero VAD
+    SileroVad vad;
+    if (!vad.load(vad_model_path)) {
+        std::cerr << "Failed to load VAD model: " << vad_model_path << std::endl;
+        return;
+    }
+    std::cout << "VAD loaded: " << vad_model_path << std::endl;
 
     // Load whisper model
     whisper_context_params cparams = whisper_context_default_params();
@@ -230,7 +247,8 @@ void jarvis_server(const std::string &model_path,
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
         std::cout << "Client connected" << std::endl;
-        handle_client(client_fd, ctx, keywords);
+        vad.reset();
+        handle_client(client_fd, ctx, vad, keywords);
         close(client_fd);
         std::cout << "Client disconnected" << std::endl;
     }

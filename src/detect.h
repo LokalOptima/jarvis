@@ -86,12 +86,5 @@ DetectResult detect_once(
     const float *pcm, int n_samples,
     DetectScratch &scratch);
 
-// Energy-based VAD. Returns true if audio has enough energy to be speech.
-static inline bool vad_check(const float *pcm, int n_samples) {
-    float energy = 0;
-    for (int i = 0; i < n_samples; i++) energy += pcm[i] * pcm[i];
-    return (energy / n_samples) >= 1e-6f;
-}
-
 // Terminal bar visualization.
 void render_bar(const char *name, float score, float threshold, int ms, bool silent);

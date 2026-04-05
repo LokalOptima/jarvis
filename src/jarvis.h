@@ -29,7 +29,8 @@ struct Keyword {
 
 class Jarvis {
 public:
-    explicit Jarvis(const std::string &whisper_model);
+    explicit Jarvis(const std::string &whisper_model,
+                    const std::string &vad_model = "models/silero_vad.bin");
     ~Jarvis();
 
     void add_keyword(Keyword kw);

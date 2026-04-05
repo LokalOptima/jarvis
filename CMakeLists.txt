@@ -22,6 +22,7 @@ add_executable(jarvis
     src/detect.cpp
     src/server.cpp
     src/client.cpp
+    src/vad_ggml.cpp
     src/whisper.cpp
     src/audio_async.cpp
     src/weather.cpp
@@ -68,6 +69,14 @@ target_include_directories(bench PRIVATE
     lib/ggml/include
 )
 target_link_libraries(bench ggml)
+
+# ---- VAD test: validate Silero VAD C implementation ----
+add_executable(vad_test
+    src/vad_test.cpp
+    src/vad_ggml.cpp
+)
+target_include_directories(vad_test PRIVATE src lib/ggml/include)
+target_link_libraries(vad_test ggml)
 
 # ---- Weather: fetch + speak utility ----
 add_executable(weather

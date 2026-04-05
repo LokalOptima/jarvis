@@ -10,5 +10,6 @@
 #include <vector>
 
 void jarvis_server(const std::string &model_path,
+                   const std::string &vad_model_path,
                    std::vector<LoadedKeyword> keywords,
                    int port);

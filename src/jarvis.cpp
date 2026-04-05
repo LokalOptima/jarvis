@@ -7,6 +7,7 @@
 
 #include "jarvis.h"
 #include "detect.h"
+#include "vad_ggml.h"
 #include <audio_async.hpp>
 
 #include <atomic>
@@ -27,10 +28,17 @@ static void signal_handler(int) { g_running.store(false, std::memory_order_relax
 
 struct Jarvis::Impl {
     struct whisper_context *ctx = nullptr;
+    SileroVad vad;
     std::vector<LoadedKeyword> keywords;
 };
 
-Jarvis::Jarvis(const std::string &whisper_model) : impl(std::make_unique<Impl>()) {
+Jarvis::Jarvis(const std::string &whisper_model,
+               const std::string &vad_model) : impl(std::make_unique<Impl>()) {
+    if (!impl->vad.load(vad_model)) {
+        throw std::runtime_error("Failed to load VAD model: " + vad_model);
+    }
+    std::cout << "VAD loaded: " << vad_model << std::endl;
+
     struct whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = false;
     impl->ctx = whisper_init_from_file_with_params(whisper_model.c_str(), cparams);
@@ -114,13 +122,21 @@ void Jarvis::listen() {
             continue;
         }
 
-        audio->get(static_cast<int>(JARVIS_BUFFER_SEC * 1000), pcm_buffer);
+        // Get latest 200ms for VAD, then full 2s for detection
+        audio->get(JARVIS_SLIDE_MS, pcm_buffer);
         if (pcm_buffer.empty()) continue;
 
-        if (!vad_check(pcm_buffer.data(), pcm_buffer.size())) {
+        bool has_speech = false;
+        for (size_t i = 0; i + SileroVad::CHUNK_SAMPLES <= pcm_buffer.size(); i += SileroVad::CHUNK_SAMPLES) {
+            if (impl->vad.process(pcm_buffer.data() + i) > 0.5f) has_speech = true;
+        }
+        if (!has_speech) {
             render_bar("", 0.0f, default_thr, 0, true);
             continue;
         }
+
+        audio->get(static_cast<int>(JARVIS_BUFFER_SEC * 1000), pcm_buffer);
+        if (pcm_buffer.empty()) continue;
 
         DetectResult det = detect_once(impl->ctx, impl->keywords,
                                        pcm_buffer.data(), pcm_buffer.size(), scratch);
@@ -144,6 +160,7 @@ void Jarvis::listen() {
             auto &cb = callbacks[det.keyword_index];
             if (cb) cb(kw.name, det.score);
 
+            impl->vad.reset();
             audio->clear();
             refractory_total = kw.refractory_ms / JARVIS_SLIDE_MS;
             refractory = refractory_total;
