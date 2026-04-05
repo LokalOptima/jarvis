@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     Args args = parse_args(argc, argv);
 
     if (args.mode == SERVER) {
-        // Server: load model + templates, no callbacks needed
+        // Server: load model + templates, runs callbacks (weather + TTS) directly
         std::vector<LoadedKeyword> keywords;
         {
             LoadedKeyword lk;

@@ -18,6 +18,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -29,22 +30,40 @@ static constexpr int   SLIDE_MS       = 200;
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
 
-// Minimal terminal bar (no detect.h dependency)
 static void status_line(const char *msg) {
     fprintf(stderr, "\r  %-40s\033[K", msg);
 }
 
-struct ClientKeyword {
-    std::string name;
-    std::string command;  // shell command to run on detection
-};
+static void play_wav(const uint8_t *data, size_t size) {
+    char tmp[] = "/tmp/jarvis-XXXXXX.wav";
+    int fd = mkstemps(tmp, 4);
+    if (fd < 0) return;
+    write(fd, data, size);
+    close(fd);
 
-static void receiver_thread(int fd, const std::vector<ClientKeyword> &keywords) {
+    fprintf(stderr, "  Playing response (%zu bytes)\n", size);
+    pid_t pid = fork();
+    if (pid == 0) {
+#ifdef __APPLE__
+        execlp("afplay", "afplay", tmp, nullptr);
+#else
+        execlp("aplay", "aplay", "-q", tmp, nullptr);
+        execlp("paplay", "paplay", tmp, nullptr);
+#endif
+        _exit(127);
+    }
+    // Don't unlink — SIG_IGN auto-reaps the child, so waitpid races with exec.
+    // Temp files are ~350KB and /tmp is cleaned on reboot.
+}
+
+static void receiver_thread(int fd) {
     MsgHeader hdr;
     std::vector<uint8_t> payload;
 
     while (g_running) {
         if (!recv_msg(fd, hdr, payload)) break;
+
+        fprintf(stderr, "  [recv] type=0x%02x len=%u\n", hdr.type, hdr.length);
 
         if (hdr.type == MSG_DETECT) {
             const char *name = (const char *)payload.data();
@@ -61,22 +80,22 @@ static void receiver_thread(int fd, const std::vector<ClientKeyword> &keywords) 
             fprintf(stderr, "\r\033[K");
             printf("  [%s] %s  sim=%.2f\n", time_buf, name, score);
 
-            for (const auto &kw : keywords) {
-                if (kw.name == name && !kw.command.empty()) {
-                    pid_t pid = fork();
-                    if (pid == 0) {
-                        execl("/bin/sh", "sh", "-c", kw.command.c_str(), nullptr);
-                        _exit(127);
-                    }
-                    break;
-                }
+        } else if (hdr.type == MSG_RESPONSE && payload.size() > sizeof(uint32_t)) {
+            // Unpack: uint32 text_len + text + wav_data
+            uint32_t text_len;
+            memcpy(&text_len, payload.data(), sizeof(text_len));
+            if (text_len > 0 && sizeof(uint32_t) + text_len <= payload.size()) {
+                printf("  %.*s\n", (int)text_len, (const char *)(payload.data() + sizeof(uint32_t)));
             }
-        } else if (hdr.type == MSG_STATUS) {
-            if (!payload.empty()) {
-                switch (payload[0]) {
-                    case STATUS_BUFFERING: status_line("server buffering..."); break;
-                    case STATUS_READY:     status_line("ready"); break;
-                }
+            size_t wav_offset = sizeof(uint32_t) + text_len;
+            if (wav_offset < payload.size()) {
+                play_wav(payload.data() + wav_offset, payload.size() - wav_offset);
+            }
+
+        } else if (hdr.type == MSG_STATUS && !payload.empty()) {
+            switch (payload[0]) {
+                case STATUS_BUFFERING: status_line("server buffering..."); break;
+                case STATUS_READY:     status_line("ready"); break;
             }
         }
     }
@@ -97,11 +116,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Keywords with callbacks — edit here to add more
-    std::vector<ClientKeyword> keywords = {
-        { "hey_jarvis", "" },  // no command = just log
-    };
-
     std::signal(SIGINT, signal_handler);
     std::signal(SIGCHLD, SIG_IGN);
     g_running = true;
@@ -114,7 +128,7 @@ int main(int argc, char **argv) {
     }
     printf("Connected\n");
 
-    std::thread rx(receiver_thread, fd, std::cref(keywords));
+    std::thread rx(receiver_thread, fd);
 
     auto audio = std::make_shared<audio_async>(static_cast<int>(BUFFER_SEC * 1000));
     audio->init(-1, SAMPLE_RATE);

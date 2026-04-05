@@ -128,19 +128,27 @@ bool speak(const std::string &text) {
 
 // ---------- CLI ----------
 
-int main(int argc, char **argv) {
-    std::string text = get_weather_text();
-    if (text.empty()) {
-        fprintf(stderr, "Failed to fetch weather\n");
-        return 1;
-    }
+// Run text through rokoko TTS, capture WAV output. Returns empty on failure.
+std::vector<uint8_t> speak_to_wav(const std::string &text) {
+    std::vector<uint8_t> result;
+    if (text.empty()) return result;
 
-    bool dry_run = (argc > 1 && std::string(argv[1]) == "--dry-run");
-    if (dry_run) {
-        printf("%s\n", text.c_str());
-    } else {
-        printf("Speaking: %s\n", text.c_str());
-        if (!speak(text)) return 1;
+    std::string escaped;
+    for (char c : text) {
+        if (c == '\'') escaped += "'\\''";
+        else escaped += c;
     }
-    return 0;
+    std::string cmd = std::string(ROKOKO_BIN) + " '" + escaped + "' --stdout";
+
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return result;
+
+    uint8_t buf[4096];
+    while (size_t n = fread(buf, 1, sizeof(buf), pipe))
+        result.insert(result.end(), buf, buf + n);
+
+    if (pclose(pipe) != 0) {
+        result.clear();
+    }
+    return result;
 }

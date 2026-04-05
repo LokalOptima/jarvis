@@ -14,9 +14,12 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
 
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
@@ -50,6 +53,32 @@ static void receiver_thread(int fd, const std::vector<Keyword> &keywords) {
                 if (kw.name == name && kw.callback) {
                     kw.callback(kw.name, score);
                     break;
+                }
+            }
+        } else if (hdr.type == MSG_RESPONSE && payload.size() > sizeof(uint32_t)) {
+            uint32_t text_len;
+            memcpy(&text_len, payload.data(), sizeof(text_len));
+            if (text_len > 0 && sizeof(uint32_t) + text_len <= payload.size()) {
+                std::cout << "  " << std::string((const char *)(payload.data() + sizeof(uint32_t)), text_len) << std::endl;
+            }
+            size_t wav_offset = sizeof(uint32_t) + text_len;
+            if (wav_offset < payload.size()) {
+                size_t wav_size = payload.size() - wav_offset;
+                char tmp[] = "/tmp/jarvis-XXXXXX.wav";
+                int tfd = mkstemps(tmp, 4);
+                if (tfd >= 0) {
+                    write(tfd, payload.data() + wav_offset, wav_size);
+                    ::close(tfd);
+                    pid_t pid = fork();
+                    if (pid == 0) {
+#ifdef __APPLE__
+                        execlp("afplay", "afplay", tmp, nullptr);
+#else
+                        execlp("aplay", "aplay", "-q", tmp, nullptr);
+                        execlp("paplay", "paplay", tmp, nullptr);
+#endif
+                        _exit(127);
+                    }
                 }
             }
         } else if (hdr.type == MSG_STATUS) {

@@ -33,9 +33,10 @@
 static constexpr int JARVIS_PORT = 7287;
 
 // Message types
-static constexpr uint8_t MSG_AUDIO  = 0x01;
-static constexpr uint8_t MSG_DETECT = 0x81;
-static constexpr uint8_t MSG_STATUS = 0x82;
+static constexpr uint8_t MSG_AUDIO    = 0x01;
+static constexpr uint8_t MSG_DETECT   = 0x81;
+static constexpr uint8_t MSG_STATUS   = 0x82;
+static constexpr uint8_t MSG_RESPONSE = 0x83;  // text (uint32 len + chars) followed by WAV audio
 
 // Status codes
 static constexpr uint8_t STATUS_BUFFERING = 0;

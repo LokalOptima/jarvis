@@ -9,6 +9,7 @@
 
 #include "server.h"
 #include "net.h"
+#include "weather.hpp"
 #include "whisper.h"
 
 #include <atomic>
@@ -73,6 +74,7 @@ static bool send_detection(int fd, const std::string &name, float score) {
 static bool send_status(int fd, uint8_t status) {
     return send_msg(fd, MSG_STATUS, &status, 1);
 }
+
 
 static void handle_client(int client_fd,
                           whisper_context *ctx,
@@ -151,6 +153,27 @@ static void handle_client(int client_fd,
 
             send_detection(client_fd, kw.name, det.score);
 
+            // Generate response: fetch weather text, TTS, send both in one message
+            std::string text = get_weather_text();
+            if (text.empty()) {
+                std::cerr << "  Weather fetch failed" << std::endl;
+            } else {
+                std::cout << "  " << text << std::endl;
+                auto wav = speak_to_wav(text);
+                if (wav.empty()) {
+                    std::cerr << "  TTS failed" << std::endl;
+                } else {
+                    // Pack: uint32 text_len + text + wav_data
+                    uint32_t text_len = text.size();
+                    std::vector<uint8_t> payload(sizeof(text_len) + text_len + wav.size());
+                    memcpy(payload.data(), &text_len, sizeof(text_len));
+                    memcpy(payload.data() + sizeof(text_len), text.data(), text_len);
+                    memcpy(payload.data() + sizeof(text_len) + text_len, wav.data(), wav.size());
+                    std::cout << "  Sending " << payload.size() << " bytes (text + audio)" << std::endl;
+                    send_msg(client_fd, MSG_RESPONSE, payload.data(), payload.size());
+                }
+            }
+
             ring.clear();
             refractory_total = kw.refractory_ms / JARVIS_SLIDE_MS;
             refractory = refractory_total;
@@ -163,7 +186,6 @@ void jarvis_server(const std::string &model_path,
                    int port)
 {
     std::signal(SIGINT, signal_handler);
-    std::signal(SIGCHLD, SIG_IGN);
     g_running = true;
 
     // Load whisper model

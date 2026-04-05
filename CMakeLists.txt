@@ -24,6 +24,7 @@ add_executable(jarvis
     src/client.cpp
     src/whisper.cpp
     src/audio_async.cpp
+    src/weather.cpp
 )
 target_include_directories(jarvis PRIVATE
     ${SDL2_INCLUDE_DIRS}
@@ -70,6 +71,7 @@ target_link_libraries(bench ggml)
 
 # ---- Weather: fetch + speak utility ----
 add_executable(weather
+    src/weather_main.cpp
     src/weather.cpp
 )
 target_include_directories(weather PRIVATE src lib)

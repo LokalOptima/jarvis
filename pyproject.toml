@@ -13,6 +13,10 @@ enroll = [
     "openai-whisper>=20250625",
     "torch>=2.11.0",
 ]
+dev = [
+    "onnx",
+    "onnxruntime",
+]
 
 [tool.uv]
 override-dependencies = [
