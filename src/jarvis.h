@@ -23,6 +23,9 @@ struct Keyword {
     std::string name;
     std::string template_path;
     std::function<void(const std::string &keyword, float score)> callback;
+    // If true, after detection record audio until silence, then call callback
+    // with the WAV file path instead of keyword name.
+    bool record_follow_up = false;
     float threshold = 0.35f;
     int refractory_ms = 2000;
 };
@@ -44,7 +47,10 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
     std::vector<std::function<void(const std::string &, float)>> callbacks;
+    std::vector<bool> record_follow_ups;
 };
 
 // Convenience: callback that fork+execs a shell command.
 std::function<void(const std::string &, float)> run_command(const std::string &cmd);
+// Convenience: run command with WAV path appended, capture stdout, print last line.
+std::function<void(const std::string &, float)> run_transcribe(const std::string &cmd);

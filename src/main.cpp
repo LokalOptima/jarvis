@@ -69,28 +69,30 @@ int main(int argc, char **argv) {
     if (args.mode == SERVER) {
         // Server: load model + templates, runs callbacks (weather + TTS) directly
         std::vector<LoadedKeyword> keywords;
-        {
+        auto add_kw = [&](const char *name, const char *tmpl, float thresh = 0.35f) {
             LoadedKeyword lk;
-            lk.name = "hey_jarvis";
-            lk.template_path = "models/templates/hey_jarvis.bin";
-            lk.threshold = 0.35f;
+            lk.name = name;
+            lk.template_path = tmpl;
+            lk.threshold = thresh;
             lk.refractory_ms = 2000;
             if (!lk.templates.load(lk.template_path)) {
                 fprintf(stderr, "Failed to load templates: %s\n", lk.template_path.c_str());
-                return 1;
+                return false;
             }
             keywords.push_back(std::move(lk));
-        }
+            return true;
+        };
+        if (!add_kw("hey_jarvis", "models/templates/hey_jarvis.bin")) return 1;
+        if (!add_kw("weather",    "models/templates/weather.bin"))    return 1;
 
         jarvis_server(args.model, args.vad_model, std::move(keywords), args.port);
 
     } else if (args.mode == CLIENT) {
         // Client: just keywords + callbacks, no model needed
+        auto weather_cb = args.detect_only ? nullptr : run_command("./build/weather");
         std::vector<Keyword> keywords;
-        keywords.push_back({
-            .name = "hey_jarvis",
-            .callback = args.detect_only ? nullptr : run_command("./build/weather"),
-        });
+        keywords.push_back({.name = "hey_jarvis"});
+        keywords.push_back({.name = "weather", .callback = weather_cb});
 
         jarvis_client(args.server_host, args.port, keywords);
 
@@ -101,6 +103,14 @@ int main(int argc, char **argv) {
         j.add_keyword({
             .name = "hey_jarvis",
             .template_path = "models/templates/hey_jarvis.bin",
+            .callback = args.detect_only ? nullptr : run_transcribe(
+                "flock --shared /tmp/gpu.lock "
+                "/home/lapo/git/LokalOptima/paraketto/paraketto.fp8"),
+            .record_follow_up = true,
+        });
+        j.add_keyword({
+            .name = "weather",
+            .template_path = "models/templates/weather.bin",
             .callback = args.detect_only ? nullptr : run_command("./build/weather"),
         });
 

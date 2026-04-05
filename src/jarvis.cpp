@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -67,13 +68,98 @@ void Jarvis::add_keyword(Keyword kw) {
     std::cout << "  " << lk.name << ": "
               << lk.templates.items.size() << " template(s), " << total << " frames"
               << (kw.callback ? " [callback]" : "") << std::endl;
-    // Store callback separately (not in LoadedKeyword which is shared with server)
+    // Store callback + follow-up flag separately (not in LoadedKeyword which is shared with server)
     callbacks.push_back(kw.callback);
+    record_follow_ups.push_back(kw.record_follow_up);
     impl->keywords.push_back(std::move(lk));
 }
 
 void Jarvis::stop() {
     g_running = false;
+}
+
+// ---- WAV file writing ----
+
+static bool save_wav(const std::string &path, const float *pcm, int n_samples) {
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    int data_bytes = n_samples * 2;
+    int file_bytes = 36 + data_bytes;
+    // RIFF header
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&file_bytes, 4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+    // fmt chunk
+    fwrite("fmt ", 1, 4, f);
+    int fmt_size = 16; fwrite(&fmt_size, 4, 1, f);
+    short audio_fmt = 1; fwrite(&audio_fmt, 2, 1, f);  // PCM
+    short channels = 1;  fwrite(&channels, 2, 1, f);
+    int rate = JARVIS_SAMPLE_RATE; fwrite(&rate, 4, 1, f);
+    int byte_rate = rate * 2; fwrite(&byte_rate, 4, 1, f);
+    short block_align = 2; fwrite(&block_align, 2, 1, f);
+    short bits = 16; fwrite(&bits, 2, 1, f);
+    // data chunk
+    fwrite("data", 1, 4, f);
+    fwrite(&data_bytes, 4, 1, f);
+    std::vector<short> buf(n_samples);
+    for (int i = 0; i < n_samples; i++) {
+        float s = pcm[i];
+        if (s > 1.0f) s = 1.0f; if (s < -1.0f) s = -1.0f;
+        buf[i] = (short)(s * 32767.0f);
+    }
+    fwrite(buf.data(), 2, n_samples, f);
+    fclose(f);
+    return true;
+}
+
+// ---- Post-detection audio recording ----
+
+static std::string record_until_silence(
+    std::shared_ptr<audio_async> audio, SileroVad &vad, int silence_timeout_ms)
+{
+    const int slide_ms = JARVIS_SLIDE_MS;
+    const int max_record_ms = 30000;  // safety cap: 30 seconds
+    int silence_ms = 0;
+    int total_ms = 0;
+    std::vector<float> recording;
+    std::vector<float> chunk;
+
+    std::cout << "  Recording..." << std::flush;
+
+    while (g_running && silence_ms < silence_timeout_ms && total_ms < max_record_ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(slide_ms));
+
+        audio->get(slide_ms, chunk);
+        if (chunk.empty()) continue;
+
+        recording.insert(recording.end(), chunk.begin(), chunk.end());
+        total_ms += slide_ms;
+
+        bool has_speech = false;
+        for (size_t i = 0; i + SileroVad::CHUNK_SAMPLES <= chunk.size(); i += SileroVad::CHUNK_SAMPLES) {
+            if (vad.process(chunk.data() + i) > 0.5f) has_speech = true;
+        }
+        if (has_speech) silence_ms = 0;
+        else silence_ms += slide_ms;
+
+        render_bar("recording", 1.0f - (float)silence_ms / silence_timeout_ms, 1.0f, 0, true);
+    }
+
+    // Trim trailing silence
+    int trim = (silence_ms * JARVIS_SAMPLE_RATE) / 1000;
+    int keep = (int)recording.size() - trim;
+    if (keep < JARVIS_SAMPLE_RATE / 4) {  // less than 250ms of speech
+        std::cout << " too short, discarded." << std::endl;
+        return "";
+    }
+    recording.resize(keep);
+
+    float dur = (float)recording.size() / JARVIS_SAMPLE_RATE;
+    std::cout << " " << dur << "s" << std::endl;
+
+    std::string path = "/tmp/jarvis_followup.wav";
+    save_wav(path, recording.data(), recording.size());
+    return path;
 }
 
 void Jarvis::listen() {
@@ -131,7 +217,7 @@ void Jarvis::listen() {
             if (impl->vad.process(pcm_buffer.data() + i) > 0.5f) has_speech = true;
         }
         if (!has_speech) {
-            render_bar("", 0.0f, default_thr, 0, true);
+            render_bar("listening", 0.0f, default_thr, 0, true);
             continue;
         }
 
@@ -157,11 +243,21 @@ void Jarvis::listen() {
             std::cout << "  [" << time_buf << "] " << kw.name
                       << "  sim=" << det.score << std::endl;
 
-            auto &cb = callbacks[det.keyword_index];
-            if (cb) cb(kw.name, det.score);
-
             impl->vad.reset();
             audio->clear();
+
+            if (record_follow_ups[det.keyword_index]) {
+                // Record until silence, then call back with WAV path
+                std::string wav = record_until_silence(audio, impl->vad, 1000);
+                impl->vad.reset();
+                audio->clear();
+                auto &cb = callbacks[det.keyword_index];
+                if (cb && !wav.empty()) cb(wav, det.score);
+            } else {
+                auto &cb = callbacks[det.keyword_index];
+                if (cb) cb(kw.name, det.score);
+            }
+
             refractory_total = kw.refractory_ms / JARVIS_SLIDE_MS;
             refractory = refractory_total;
         }
@@ -181,5 +277,24 @@ std::function<void(const std::string &, float)> run_command(const std::string &c
         } else if (pid < 0) {
             perror("fork");
         }
+    };
+}
+
+std::function<void(const std::string &, float)> run_transcribe(const std::string &cmd) {
+    return [cmd](const std::string &wav_path, float) {
+        std::string full = cmd + " " + wav_path + " 2>/dev/null";
+        FILE *pipe = popen(full.c_str(), "r");
+        if (!pipe) { perror("popen"); return; }
+        std::string last_line;
+        char buf[4096];
+        while (fgets(buf, sizeof(buf), pipe)) {
+            std::string line(buf);
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+                line.pop_back();
+            if (!line.empty()) last_line = line;
+        }
+        pclose(pipe);
+        if (!last_line.empty())
+            std::cout << "  > " << last_line << std::endl;
     };
 }
