@@ -4,8 +4,8 @@
     uv run enroll
 
 Opens a browser to record wake words one at a time, visually trim them
-with wavesurfer.js, review/delete clips, and build templates for the
-C++ runtime.  Supports multiple keywords via tabs.
+with a canvas-based waveform editor, review/delete clips, and build
+templates for the C++ runtime.  Supports multiple keywords via tabs.
 """
 
 import io
@@ -156,9 +156,9 @@ HTML = r"""<!DOCTYPE html>
 
   /* Waveform */
   .wave-box { background: #16213e; border-radius: 8px; padding: 12px; margin: 12px 0;
-              min-height: 100px; display: none; }
+              display: none; }
   .wave-box.vis { display: block; }
-  #waveform { width: 100%; }
+  #waveform { display: block; width: 100%; height: 90px; }
   .wave-actions { display: flex; gap: 8px; margin-top: 10px; }
 
   /* Buttons */
@@ -218,7 +218,7 @@ HTML = r"""<!DOCTYPE html>
 
 <!-- Waveform + trim -->
 <div class="wave-box" id="wave-box">
-  <div id="waveform"></div>
+  <canvas id="waveform"></canvas>
   <div class="wave-actions">
     <button class="btn" onclick="playRegion()">Play region</button>
     <button class="btn primary" onclick="saveClip()">Save clip</button>
@@ -241,23 +241,34 @@ HTML = r"""<!DOCTYPE html>
 <div id="clips"></div>
 <div class="status" id="bst"></div>
 
-<script type="module">
-import WaveSurfer from 'https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.esm.js';
-import RegionsPlugin from 'https://unpkg.com/wavesurfer.js@7/dist/plugins/regions.esm.js';
-
+<script>
 const $ = id => document.getElementById(id);
 
 // ---- State ----
-let currentKw = null;    // active keyword name
-let micStream = null;    // persistent mic stream (kept alive to avoid warm-up)
-let rec = null;          // MediaRecorder
-let chunks = [];
-let timer = null;
-let ws = null;           // wavesurfer instance
-let regions = null;      // regions plugin
-let trimRegion = null;   // the active trim region
-let recordedBlob = null; // original recording blob (native quality)
-let audioBuf = null;     // decoded AudioBuffer (native sample rate)
+let currentKw = null;
+let micStream = null;
+let rec = null, chunks = [], timer = null;
+let audioBuf = null;      // decoded AudioBuffer (native sample rate)
+let regionStart = 0;      // seconds
+let regionEnd = 0;        // seconds
+
+// Canvas
+const canvas = $('waveform');
+const cctx = canvas.getContext('2d');
+let canvasW = 0, canvasH = 90;
+let peaks = null;         // {min: Float32Array, max: Float32Array}
+
+// Playback
+let playCtx = null;
+let playSource = null;
+let playStartedAt = 0;
+let playRegionStart = 0;
+let animFrame = null;
+
+// Drag
+let dragging = null;      // 'start' | 'end' | null
+const HANDLE_HIT = 10;    // pixels
+const BAR_W = 2, BAR_GAP = 1, BAR_STEP = BAR_W + BAR_GAP;
 
 const MIC_CONSTRAINTS = {audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false}};
 
@@ -271,7 +282,327 @@ async function ensureMic() {
 function st(el, msg, cls) { el.textContent = msg; el.className = 'status vis ' + cls; }
 function clearSt(el) { el.className = 'status'; el.textContent = ''; }
 
+// ---- Canvas / Waveform ----
+
+function sizeCanvas() {
+  const box = $('wave-box');
+  canvasW = box.clientWidth - 24; // subtract padding
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(canvasW * dpr);
+  canvas.height = Math.round(canvasH * dpr);
+  canvas.style.width = canvasW + 'px';
+  canvas.style.height = canvasH + 'px';
+  cctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function computePeaks() {
+  if (!audioBuf) return;
+  const chan = audioBuf.getChannelData(0);
+  const numBins = Math.floor(canvasW / BAR_STEP);
+  const samplesPerBin = chan.length / numBins;
+  peaks = new Float32Array(numBins);
+  for (let i = 0; i < numBins; i++) {
+    const s = Math.floor(i * samplesPerBin);
+    const e = Math.min(Math.floor((i + 1) * samplesPerBin), chan.length);
+    let pk = 0;
+    for (let j = s; j < e; j++) {
+      const a = Math.abs(chan[j]);
+      if (a > pk) pk = a;
+    }
+    peaks[i] = pk;
+  }
+}
+
+function draw() {
+  if (!audioBuf || !peaks) return;
+  const w = canvasW, h = canvasH;
+  const mid = h / 2;
+  const startX = timeToX(regionStart);
+  const endX = timeToX(regionEnd);
+
+  cctx.clearRect(0, 0, w, h);
+
+  // Waveform bars — batched by region to avoid per-bar state changes
+  for (const [color, test] of [['#1e2d44', false], ['#4a6fa5', true]]) {
+    cctx.fillStyle = color;
+    for (let i = 0; i < peaks.length; i++) {
+      const x = i * BAR_STEP;
+      const inRegion = (x + BAR_W) >= startX && x <= endX;
+      if (inRegion !== test) continue;
+      const barH = Math.max(peaks[i] * mid, 0.5);
+      cctx.fillRect(x, mid - barH, BAR_W, barH * 2);
+    }
+  }
+
+  // Dim overlay outside region
+  cctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+  cctx.fillRect(0, 0, startX, h);
+  cctx.fillRect(endX, 0, w - endX, h);
+
+  // Handles
+  drawHandle(startX);
+  drawHandle(endX);
+
+  // Cursor during playback
+  if (playSource && playCtx) {
+    const elapsed = playCtx.currentTime - playStartedAt;
+    const cursorTime = playRegionStart + elapsed;
+    if (cursorTime >= regionStart && cursorTime <= regionEnd) {
+      const cx = timeToX(cursorTime);
+      cctx.strokeStyle = '#e94560';
+      cctx.lineWidth = 2;
+      cctx.beginPath();
+      cctx.moveTo(cx, 0);
+      cctx.lineTo(cx, h);
+      cctx.stroke();
+    }
+  }
+}
+
+function drawHandle(x) {
+  const h = canvasH;
+  // Vertical line
+  cctx.strokeStyle = '#e94560';
+  cctx.lineWidth = 2;
+  cctx.beginPath();
+  cctx.moveTo(x, 0);
+  cctx.lineTo(x, h);
+  cctx.stroke();
+  // Grab tab at top
+  cctx.fillStyle = '#e94560';
+  cctx.beginPath();
+  cctx.roundRect(x - 5, 0, 10, 14, [0, 0, 3, 3]);
+  cctx.fill();
+  // Grab tab at bottom
+  cctx.beginPath();
+  cctx.roundRect(x - 5, h - 14, 10, 14, [3, 3, 0, 0]);
+  cctx.fill();
+}
+
+function initWaveform() {
+  $('wave-box').classList.add('vis');
+  sizeCanvas();
+  const dur = audioBuf.duration;
+  const pad = Math.min(0.05, dur * 0.05);
+  regionStart = pad;
+  regionEnd = dur - pad;
+  computePeaks();
+  draw();
+}
+
+function destroyWaveform() {
+  stopPlayback();
+  $('wave-box').classList.remove('vis');
+  peaks = null;
+  regionStart = 0;
+  regionEnd = 0;
+}
+
+// ---- Drag handling ----
+
+function timeToX(t) { return (t / audioBuf.duration) * canvasW; }
+function xToTime(x) { return (x / canvasW) * audioBuf.duration; }
+function mouseX(e) { return e.clientX - canvas.getBoundingClientRect().left; }
+
+canvas.addEventListener('mousedown', (e) => {
+  if (!audioBuf) return;
+  const x = mouseX(e);
+  const sx = timeToX(regionStart), ex = timeToX(regionEnd);
+  if (Math.abs(x - sx) < HANDLE_HIT) dragging = 'start';
+  else if (Math.abs(x - ex) < HANDLE_HIT) dragging = 'end';
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  if (!audioBuf) return;
+  const x = mouseX(e);
+
+  if (dragging) {
+    const t = Math.max(0, Math.min(audioBuf.duration, xToTime(x)));
+    const minLen = 0.05;
+    if (dragging === 'start') regionStart = Math.min(t, regionEnd - minLen);
+    else regionEnd = Math.max(t, regionStart + minLen);
+    draw();
+    return;
+  }
+  const sx = timeToX(regionStart), ex = timeToX(regionEnd);
+  canvas.style.cursor =
+    (Math.abs(x - sx) < HANDLE_HIT || Math.abs(x - ex) < HANDLE_HIT)
+      ? 'col-resize' : 'default';
+});
+
+window.addEventListener('mouseup', () => { dragging = null; });
+
+// ---- Playback ----
+
+function stopPlayback() {
+  if (playSource) { try { playSource.stop(); } catch(e) {} playSource = null; }
+  if (playCtx) { playCtx.close().catch(() => {}); playCtx = null; }
+  if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
+}
+
+function playRegion() {
+  if (!audioBuf) return;
+  stopPlayback();
+
+  playCtx = new AudioContext();
+  playSource = playCtx.createBufferSource();
+  playSource.buffer = audioBuf;
+  playSource.connect(playCtx.destination);
+
+  const duration = regionEnd - regionStart;
+  playRegionStart = regionStart;
+  playStartedAt = playCtx.currentTime;
+  // Sample-accurate: audio thread enforces stop at regionEnd
+  playSource.start(0, regionStart, duration);
+
+  playSource.onended = () => {
+    playSource = null;
+    cancelAnimationFrame(animFrame);
+    animFrame = null;
+    draw();
+  };
+
+  function animate() {
+    draw();
+    if (playSource) animFrame = requestAnimationFrame(animate);
+  }
+  animate();
+}
+
+// ---- Recording ----
+
+async function toggleRec() {
+  if (!currentKw) { st($('st'), 'Add a keyword first', 'err'); return; }
+  const btn = $('rec-btn'), label = $('rec-label'), time = $('rec-time');
+
+  if (rec && rec.state === 'recording') {
+    rec.stop(); btn.classList.remove('on');
+    label.textContent = 'Processing...'; time.textContent = '';
+    clearInterval(timer); return;
+  }
+
+  destroyWaveform();
+  audioBuf = null;
+  clearSt($('st'));
+
+  try {
+    rec = new MediaRecorder(await ensureMic());
+    chunks = [];
+    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    rec.onstop = async () => {
+      if (!chunks.length) { label.textContent = 'No audio'; return; }
+      try {
+        const blob = new Blob(chunks, {type: rec.mimeType});
+        const ctx = new AudioContext();
+        audioBuf = await ctx.decodeAudioData(await blob.arrayBuffer());
+        ctx.close();
+        initWaveform();
+        updateRecLabel();
+      } catch(e) {
+        st($('st'), 'Decode error: ' + e.message, 'err');
+        updateRecLabel();
+      }
+    };
+    btn.classList.add('on');
+    await new Promise(r => setTimeout(r, 150));
+    rec.start();
+    const t0 = Date.now();
+    const tick = () => { time.textContent = ((Date.now()-t0)/1000).toFixed(1) + 's'; };
+    tick(); timer = setInterval(tick, 200);
+    label.textContent = 'Say "' + currentKw.replace(/_/g, ' ') + '" once — click stop when done';
+  } catch(e) { label.textContent = 'Mic denied'; st($('st'), e.message, 'err'); }
+}
+
+// ---- Resampling ----
+async function resampleRegion(mono, fromRate, toRate) {
+  const outLen = Math.round(mono.length * toRate / fromRate);
+  const offCtx = new OfflineAudioContext(1, outLen, toRate);
+  const buf = offCtx.createBuffer(1, mono.length, fromRate);
+  buf.getChannelData(0).set(mono);
+  const src = offCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(offCtx.destination);
+  src.start();
+  const rendered = await offCtx.startRendering();
+  return rendered.getChannelData(0);
+}
+
+// ---- WAV encoding ----
+function encodeWAV(samples, sampleRate) {
+  const numSamples = samples.length;
+  const buffer = new ArrayBuffer(44 + numSamples * 2);
+  const view = new DataView(buffer);
+  writeStr(view, 0, 'RIFF');
+  view.setUint32(4, 36 + numSamples * 2, true);
+  writeStr(view, 8, 'WAVE');
+  writeStr(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(view, 36, 'data');
+  view.setUint32(40, numSamples * 2, true);
+  for (let i = 0; i < numSamples; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buffer;
+}
+function writeStr(view, offset, str) {
+  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+}
+
+// ---- Trim actions ----
+
+async function saveClip() {
+  if (!audioBuf || !currentKw) return;
+  const dur = regionEnd - regionStart;
+  if (dur < 0.2) { st($('st'), 'Clip too short (< 0.2s)', 'err'); return; }
+
+  const nativeSR = audioBuf.sampleRate;
+  const startSample = Math.round(regionStart * nativeSR);
+  const endSample = Math.round(regionEnd * nativeSR);
+  const regionLen = endSample - startSample;
+
+  // Mix to mono
+  const mono = new Float32Array(regionLen);
+  for (let ch = 0; ch < audioBuf.numberOfChannels; ch++) {
+    const chan = audioBuf.getChannelData(ch);
+    for (let i = 0; i < regionLen; i++) mono[i] += chan[startSample + i];
+  }
+  if (audioBuf.numberOfChannels > 1) {
+    for (let i = 0; i < regionLen; i++) mono[i] /= audioBuf.numberOfChannels;
+  }
+
+  const pcm16k = await resampleRegion(mono, nativeSR, 16000);
+  const wavBuf = encodeWAV(pcm16k, 16000);
+  st($('st'), 'Saving...', 'wait');
+  try {
+    const r = await fetch('/api/save-clip', {
+      method: 'POST', body: wavBuf,
+      headers: {'X-Keyword': currentKw, 'Content-Type': 'audio/wav'},
+    });
+    const d = await r.json();
+    if (d.error) { st($('st'), d.error, 'err'); return; }
+    st($('st'), 'Saved ' + d.name, 'ok');
+    destroyWaveform();
+    audioBuf = null;
+    loadClips();
+  } catch(e) { st($('st'), e.message, 'err'); }
+}
+
+function discardClip() {
+  destroyWaveform();
+  audioBuf = null;
+  clearSt($('st'));
+  updateRecLabel();
+}
+
 // ---- Keyword tabs ----
+
 async function loadKeywords() {
   const kws = await (await fetch('/api/keywords')).json();
   const bar = $('kw-bar');
@@ -286,7 +617,6 @@ async function loadKeywords() {
     });
     bar.appendChild(tab);
   }
-  // Auto-select first if none selected
   if (!currentKw && kws.length) selectKw(kws[0]);
   if (currentKw && !kws.includes(currentKw)) { currentKw = kws[0] || null; }
   updateRecLabel();
@@ -331,207 +661,8 @@ function updateRecLabel() {
   else label.textContent = 'Click to record "' + currentKw.replace(/_/g, ' ') + '"';
 }
 
-// ---- Resampling ----
-async function resampleRegion(mono, fromRate, toRate) {
-  // mono: Float32Array at fromRate → returns Float32Array at toRate
-  const outLen = Math.round(mono.length * toRate / fromRate);
-  const offCtx = new OfflineAudioContext(1, outLen, toRate);
-  const buf = offCtx.createBuffer(1, mono.length, fromRate);
-  buf.getChannelData(0).set(mono);
-  const src = offCtx.createBufferSource();
-  src.buffer = buf;
-  src.connect(offCtx.destination);
-  src.start();
-  const rendered = await offCtx.startRendering();
-  return rendered.getChannelData(0);
-}
-
-// ---- WAV encoding ----
-function encodeWAV(samples, sampleRate) {
-  // samples: Float32Array [-1..1], sampleRate: 16000
-  const numSamples = samples.length;
-  const buffer = new ArrayBuffer(44 + numSamples * 2);
-  const view = new DataView(buffer);
-  // RIFF header
-  writeStr(view, 0, 'RIFF');
-  view.setUint32(4, 36 + numSamples * 2, true);
-  writeStr(view, 8, 'WAVE');
-  // fmt chunk
-  writeStr(view, 12, 'fmt ');
-  view.setUint32(16, 16, true);         // chunk size
-  view.setUint16(20, 1, true);          // PCM
-  view.setUint16(22, 1, true);          // mono
-  view.setUint32(24, sampleRate, true);  // sample rate
-  view.setUint32(28, sampleRate * 2, true); // byte rate
-  view.setUint16(32, 2, true);          // block align
-  view.setUint16(34, 16, true);         // bits per sample
-  // data chunk
-  writeStr(view, 36, 'data');
-  view.setUint32(40, numSamples * 2, true);
-  for (let i = 0; i < numSamples; i++) {
-    let s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-  return buffer;
-}
-function writeStr(view, offset, str) {
-  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-}
-
-// ---- wavesurfer ----
-function initWavesurfer() {
-  destroyWavesurfer();
-
-  regions = RegionsPlugin.create();
-  ws = WaveSurfer.create({
-    container: '#waveform',
-    waveColor: '#4a6fa5',
-    progressColor: '#4a6fa5',
-    cursorColor: '#e94560',
-    height: 80,
-    barWidth: 2,
-    barGap: 1,
-    barRadius: 2,
-    plugins: [regions],
-  });
-
-  // Load original blob directly — no resampling for display/playback
-  ws.loadBlob(recordedBlob);
-
-  ws.on('ready', () => {
-    const dur = ws.getDuration();
-    // Auto-create trim region spanning most of the waveform
-    const pad = Math.min(0.05, dur * 0.05);
-    trimRegion = regions.addRegion({
-      start: pad,
-      end: dur - pad,
-      color: 'rgba(233, 69, 96, 0.15)',
-      drag: true,
-      resize: true,
-    });
-  });
-
-  $('wave-box').classList.add('vis');
-}
-
-function destroyWavesurfer() {
-  if (ws) { ws.destroy(); ws = null; }
-  regions = null;
-  trimRegion = null;
-  $('wave-box').classList.remove('vis');
-}
-
-// ---- Recording ----
-async function toggleRec() {
-  if (!currentKw) { st($('st'), 'Add a keyword first', 'err'); return; }
-  const btn = $('rec-btn'), label = $('rec-label'), time = $('rec-time');
-
-  if (rec && rec.state === 'recording') {
-    rec.stop(); btn.classList.remove('on');
-    label.textContent = 'Processing...'; time.textContent = '';
-    clearInterval(timer); return;
-  }
-
-  // Discard previous waveform
-  destroyWavesurfer();
-  clearSt($('st'));
-
-  try {
-    rec = new MediaRecorder(await ensureMic());
-    chunks = [];
-    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-    rec.onstop = async () => {
-      if (!chunks.length) { label.textContent = 'No audio'; return; }
-      try {
-        recordedBlob = new Blob(chunks, {type: rec.mimeType});
-        const ctx = new AudioContext();
-        audioBuf = await ctx.decodeAudioData(await recordedBlob.arrayBuffer());
-        initWavesurfer();
-        updateRecLabel();
-      } catch(e) {
-        st($('st'), 'Decode error: ' + e.message, 'err');
-        updateRecLabel();
-      }
-    };
-    rec.start();
-    btn.classList.add('on');
-    const t0 = Date.now();
-    const tick = () => { time.textContent = ((Date.now()-t0)/1000).toFixed(1) + 's'; };
-    tick(); timer = setInterval(tick, 200);
-    label.textContent = 'Say "' + currentKw.replace(/_/g, ' ') + '" once — click stop when done';
-  } catch(e) { label.textContent = 'Mic denied'; st($('st'), e.message, 'err'); }
-}
-
-// ---- Trim actions ----
-function playRegion() {
-  if (!ws || !trimRegion) return;
-  const end = trimRegion.end;
-  const onTick = (t) => {
-    if (t >= end) {
-      ws.pause();
-      ws.setTime(end);
-      ws.un('timeupdate', onTick);
-    }
-  };
-  ws.on('timeupdate', onTick);
-  ws.setTime(trimRegion.start);
-  ws.play();
-}
-
-async function saveClip() {
-  if (!ws || !trimRegion || !audioBuf || !currentKw) return;
-  const start = trimRegion.start;
-  const end = trimRegion.end;
-  const dur = end - start;
-
-  if (dur < 0.2) {
-    st($('st'), 'Clip too short (< 0.2s)', 'err'); return;
-  }
-
-  // Extract the selected region from the native-rate buffer
-  const nativeSR = audioBuf.sampleRate;
-  const startSample = Math.round(start * nativeSR);
-  const endSample = Math.round(end * nativeSR);
-  const regionLen = endSample - startSample;
-
-  // Mix to mono
-  const mono = new Float32Array(regionLen);
-  for (let ch = 0; ch < audioBuf.numberOfChannels; ch++) {
-    const chan = audioBuf.getChannelData(ch);
-    for (let i = 0; i < regionLen; i++) mono[i] += chan[startSample + i];
-  }
-  if (audioBuf.numberOfChannels > 1) {
-    for (let i = 0; i < regionLen; i++) mono[i] /= audioBuf.numberOfChannels;
-  }
-
-  // Resample to 16kHz
-  const pcm16k = await resampleRegion(mono, nativeSR, 16000);
-  const wavBuf = encodeWAV(pcm16k, 16000);
-  st($('st'), 'Saving...', 'wait');
-  try {
-    const r = await fetch('/api/save-clip', {
-      method: 'POST', body: wavBuf,
-      headers: {'X-Keyword': currentKw, 'Content-Type': 'audio/wav'},
-    });
-    const d = await r.json();
-    if (d.error) { st($('st'), d.error, 'err'); return; }
-    st($('st'), 'Saved ' + d.name, 'ok');
-    destroyWavesurfer();
-    recordedBlob = null;
-    audioBuf = null;
-    loadClips();
-  } catch(e) { st($('st'), e.message, 'err'); }
-}
-
-function discardClip() {
-  destroyWavesurfer();
-  recordedBlob = null;
-  audioBuf = null;
-  clearSt($('st'));
-  updateRecLabel();
-}
-
 // ---- Clips list ----
+
 async function loadClips() {
   if (!currentKw) {
     $('clips').innerHTML = '<div class="empty">No keyword selected.</div>';
@@ -553,20 +684,21 @@ async function loadClips() {
       '<span class="name">' + c.name + '</span>' +
       '<span class="dur">' + c.duration + 's</span>' +
       '<audio controls preload="metadata" src="/clip/' + currentKw + '/' + c.name + '"></audio>' +
-      '<button class="del" onclick="window._del(\'' + c.name + '\')">delete</button></div>';
+      '<button class="del" onclick="delClip(\'' + c.name + '\')">delete</button></div>';
   }
   el.innerHTML = html;
 }
 
-window._del = async function(name) {
+function delClip(name) {
   if (!confirm('Delete ' + name + '?')) return;
-  await fetch('/api/delete?keyword=' + encodeURIComponent(currentKw) + '&name=' + encodeURIComponent(name),
-    {method: 'POST'});
-  const row = $('r-' + name); if (row) row.remove();
-  const n = document.querySelectorAll('.clip').length;
-  $('count').textContent = n + ' clips (' + currentKw + ')';
-  $('build-btn').disabled = !n;
-};
+  fetch('/api/delete?keyword=' + encodeURIComponent(currentKw) + '&name=' + encodeURIComponent(name),
+    {method: 'POST'}).then(() => {
+    const row = $('r-' + name); if (row) row.remove();
+    const n = document.querySelectorAll('.clip').length;
+    $('count').textContent = n + ' clips (' + currentKw + ')';
+    $('build-btn').disabled = !n;
+  }).catch(e => st($('st'), e.message, 'err'));
+}
 
 async function playAll() {
   for (const a of document.querySelectorAll('.clip audio')) {
@@ -576,6 +708,7 @@ async function playAll() {
 }
 
 // ---- Build ----
+
 async function build() {
   $('build-btn').disabled = true;
   st($('bst'), 'Building templates...', 'wait');
@@ -589,19 +722,9 @@ async function build() {
   $('build-btn').disabled = false;
 }
 
-// Expose to onclick handlers
-window.toggleRec = toggleRec;
-window.playRegion = playRegion;
-window.saveClip = saveClip;
-window.discardClip = discardClip;
-window.addKeyword = addKeyword;
-window.playAll = playAll;
-window.build = build;
-
 // ---- Init ----
 loadKeywords();
 loadClips();
-// Acquire mic early so it's warm by first recording
 ensureMic().catch(() => {});
 </script>
 </body>
@@ -675,6 +798,14 @@ class Handler(SimpleHTTPRequestHandler):
     # --- GET handlers ---
 
     @staticmethod
+    def _valid_kw_dir(kw: str) -> Path | None:
+        """Return keyword dir if it doesn't escape CLIPS_DIR, else None."""
+        kw_dir = CLIPS_DIR / kw
+        if kw_dir.resolve().parent == CLIPS_DIR.resolve():
+            return kw_dir
+        return None
+
+    @staticmethod
     def _safe_clip_path(kw: str, name: str) -> Path | None:
         """Resolve a clip path, returning None if it escapes CLIPS_DIR."""
         kw_dir = CLIPS_DIR / kw
@@ -696,13 +827,13 @@ class Handler(SimpleHTTPRequestHandler):
     def _clips(self, parsed):
         qs = parse_qs(parsed.query)
         kw = qs.get("keyword", [""])[0]
-        kw_dir = CLIPS_DIR / kw
+        kw_dir = self._valid_kw_dir(kw) if kw else None
         clips = []
-        if kw and kw_dir.exists() and kw_dir.resolve().parent == CLIPS_DIR.resolve():
+        if kw_dir and kw_dir.exists():
             for f in sorted(kw_dir.glob("*.wav")):
                 with wave.open(str(f), "rb") as wf:
                     dur = round(wf.getnframes() / wf.getframerate(), 1)
-                clips.append({"name": f.name, "duration": dur, "mtime": f.stat().st_mtime})
+                clips.append({"name": f.name, "duration": dur})
         self._json(clips)
 
     def _serve_clip(self, kw, name):
@@ -741,13 +872,11 @@ class Handler(SimpleHTTPRequestHandler):
             self._json({"error": f"Invalid WAV: {e}"})
             return
 
-        kw_dir = CLIPS_DIR / kw
-        kw_dir.mkdir(parents=True, exist_ok=True)
-
-        # Validate path doesn't escape
-        if kw_dir.resolve().parent != CLIPS_DIR.resolve():
+        kw_dir = self._valid_kw_dir(kw)
+        if not kw_dir:
             self._json({"error": "Invalid keyword"})
             return
+        kw_dir.mkdir(parents=True, exist_ok=True)
 
         idx = next_clip_index(kw_dir)
         clip_path = kw_dir / f"clip_{idx:04d}.wav"
@@ -778,8 +907,8 @@ class Handler(SimpleHTTPRequestHandler):
         except ValueError as e:
             self._json({"error": str(e)})
             return
-        kw_dir = CLIPS_DIR / kw
-        if kw_dir.resolve().parent != CLIPS_DIR.resolve():
+        kw_dir = self._valid_kw_dir(kw)
+        if not kw_dir:
             self._json({"error": "Invalid name"})
             return
         kw_dir.mkdir(parents=True, exist_ok=True)
@@ -791,8 +920,8 @@ class Handler(SimpleHTTPRequestHandler):
         if not name:
             self._json({"error": "No name"})
             return
-        kw_dir = CLIPS_DIR / name
-        if not kw_dir.exists() or kw_dir.resolve().parent != CLIPS_DIR.resolve():
+        kw_dir = self._valid_kw_dir(name)
+        if not kw_dir or not kw_dir.exists():
             self._json({"error": "Not found"})
             return
         shutil.rmtree(kw_dir)
