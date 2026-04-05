@@ -4,12 +4,12 @@
 
 #pragma once
 
-#include "detect.h"
+#include "jarvis.h"
 
 #include <string>
 #include <vector>
 
 void jarvis_server(const std::string &model_path,
                    const std::string &vad_model_path,
-                   std::vector<LoadedKeyword> keywords,
+                   const std::vector<Keyword> &keywords,
                    int port);

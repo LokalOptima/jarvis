@@ -63,8 +63,6 @@ static void receiver_thread(int fd) {
     while (g_running) {
         if (!recv_msg(fd, hdr, payload)) break;
 
-        fprintf(stderr, "  [recv] type=0x%02x len=%u\n", hdr.type, hdr.length);
-
         if (hdr.type == MSG_DETECT) {
             const char *name = (const char *)payload.data();
             float score = 0;

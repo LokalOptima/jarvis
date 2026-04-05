@@ -16,13 +16,20 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
+class audio_async;
+
 // A pipeline step: string in, string out. Empty return stops the pipeline.
-using PipeStep = std::function<std::string(const std::string &)>;
+struct PipeStep {
+    std::string desc;
+    std::function<std::string(const std::string &)> fn;
+    std::string operator()(const std::string &input) const { return fn(input); }
+};
 
 struct Keyword {
     std::string name;
@@ -42,8 +49,17 @@ public:
     ~Jarvis();
 
     void add_keyword(Keyword kw);
-    void listen();  // blocking — runs until stop() or SIGINT
+    void listen();                                      // local: creates SDL2 audio, installs SIGINT
+    void listen(std::shared_ptr<audio_async> audio);    // external audio: loops until stop()
     void stop();
+
+    // Mutate pipelines by keyword name (for per-connection server setup)
+    void set_pipeline(const std::string &name, std::vector<PipeStep> pipe);
+    void set_record_follow_up(const std::string &name, bool val);
+
+    // Server hooks — called from the detection loop
+    std::function<void(const std::string &name, float score)> on_detect;
+    std::function<void()> on_ready;
 
     Jarvis(const Jarvis &) = delete;
     Jarvis &operator=(const Jarvis &) = delete;
@@ -53,6 +69,7 @@ private:
     std::unique_ptr<Impl> impl;
     std::vector<std::vector<PipeStep>> pipelines;
     std::vector<bool> record_follow_ups;
+    std::atomic<bool> m_running{false};
 };
 
 // Run a pipeline: feeds input through each step in sequence.

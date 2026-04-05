@@ -187,9 +187,12 @@ HTML = r"""<!DOCTYPE html>
   .clip .name { font-family: monospace; min-width: 130px; font-size: 0.9em; }
   .clip .dur { color: #888; min-width: 42px; font-size: 0.85em; }
   .clip audio { height: 32px; flex: 1; }
-  .del { background: #e94560; color: white; border: none; padding: 3px 10px; border-radius: 4px;
-         cursor: pointer; font-size: 0.85em; }
-  .del:hover { background: #c73650; }
+  .edit { background: none; border: 1px solid #555; color: #ccc; padding: 3px 8px; border-radius: 4px;
+    cursor: pointer; font-size: 0.85em; }
+  .edit:hover { border-color: #4fc3f7; color: #4fc3f7; }
+  .del { background: #1a2744; color: #e94560; border: 1px solid #555; padding: 3px 8px; border-radius: 4px;
+         cursor: pointer; font-size: 0.85em; font-weight: bold; }
+  .del:hover { border-color: #e94560; }
   .empty { color: #555; padding: 32px; text-align: center; }
 </style>
 </head>
@@ -251,6 +254,7 @@ let rec = null, chunks = [], timer = null;
 let audioBuf = null;      // decoded AudioBuffer (native sample rate)
 let regionStart = 0;      // seconds
 let regionEnd = 0;        // seconds
+let editingClip = null;   // clip name being edited (null = new clip)
 
 // Canvas
 const canvas = $('waveform');
@@ -485,6 +489,7 @@ async function toggleRec() {
   audioBuf = null;
   clearSt($('st'));
 
+  editingClip = null;
   try {
     rec = new MediaRecorder(await ensureMic());
     chunks = [];
@@ -581,15 +586,17 @@ async function saveClip() {
   const wavBuf = encodeWAV(pcm16k, 16000);
   st($('st'), 'Saving...', 'wait');
   try {
+    const hdrs = {'X-Keyword': currentKw, 'Content-Type': 'audio/wav'};
+    if (editingClip) hdrs['X-Clip-Name'] = editingClip;
     const r = await fetch('/api/save-clip', {
-      method: 'POST', body: wavBuf,
-      headers: {'X-Keyword': currentKw, 'Content-Type': 'audio/wav'},
+      method: 'POST', body: wavBuf, headers: hdrs,
     });
     const d = await r.json();
     if (d.error) { st($('st'), d.error, 'err'); return; }
     st($('st'), 'Saved ' + d.name, 'ok');
     destroyWaveform();
     audioBuf = null;
+    editingClip = null;
     loadClips();
   } catch(e) { st($('st'), e.message, 'err'); }
 }
@@ -597,6 +604,7 @@ async function saveClip() {
 function discardClip() {
   destroyWaveform();
   audioBuf = null;
+  editingClip = null;
   clearSt($('st'));
   updateRecLabel();
 }
@@ -684,7 +692,8 @@ async function loadClips() {
       '<span class="name">' + c.name + '</span>' +
       '<span class="dur">' + c.duration + 's</span>' +
       '<audio controls preload="metadata" src="/clip/' + currentKw + '/' + c.name + '"></audio>' +
-      '<button class="del" onclick="delClip(\'' + c.name + '\')">delete</button></div>';
+      '<button class="edit" onclick="editClip(\'' + c.name + '\')" title="Edit clip">&#9998;</button>' +
+      '<button class="del" onclick="delClip(\'' + c.name + '\')" title="Delete clip">&#10005;</button></div>';
   }
   el.innerHTML = html;
 }
@@ -698,6 +707,21 @@ function delClip(name) {
     $('count').textContent = n + ' clips (' + currentKw + ')';
     $('build-btn').disabled = !n;
   }).catch(e => st($('st'), e.message, 'err'));
+}
+
+async function editClip(name) {
+  if (!currentKw) return;
+  st($('st'), 'Loading ' + name + '...', 'wait');
+  try {
+    const resp = await fetch('/clip/' + encodeURIComponent(currentKw) + '/' + encodeURIComponent(name));
+    if (!resp.ok) { st($('st'), 'Failed to load clip', 'err'); return; }
+    const ctx = new AudioContext();
+    audioBuf = await ctx.decodeAudioData(await resp.arrayBuffer());
+    ctx.close();
+    editingClip = name;
+    initWaveform();
+    st($('st'), 'Editing ' + name, 'ok');
+  } catch(e) { st($('st'), e.message, 'err'); }
 }
 
 async function playAll() {
@@ -878,8 +902,17 @@ class Handler(SimpleHTTPRequestHandler):
             return
         kw_dir.mkdir(parents=True, exist_ok=True)
 
-        idx = next_clip_index(kw_dir)
-        clip_path = kw_dir / f"clip_{idx:04d}.wav"
+        # If X-Clip-Name is set, overwrite an existing clip (edit mode)
+        clip_name = self.headers.get("X-Clip-Name", "").strip()
+        if clip_name:
+            clip_path = kw_dir / clip_name
+            if not clip_path.exists() or clip_path.parent != kw_dir:
+                self._json({"error": "Clip not found"})
+                return
+        else:
+            idx = next_clip_index(kw_dir)
+            clip_path = kw_dir / f"clip_{idx:04d}.wav"
+
         clip_path.write_bytes(wav_bytes)
 
         total = len(list(kw_dir.glob("*.wav")))

@@ -8,7 +8,6 @@
  */
 
 #include "jarvis.h"
-#include "detect.h"
 #include "net.h"
 #include "server.h"
 #include "client.h"
@@ -67,34 +66,20 @@ int main(int argc, char **argv) {
     Args args = parse_args(argc, argv);
 
     if (args.mode == SERVER) {
-        // Server: load model + templates, runs callbacks (weather + TTS) directly
-        std::vector<LoadedKeyword> keywords;
-        auto add_kw = [&](const char *name, const char *tmpl, float thresh = 0.35f) {
-            LoadedKeyword lk;
-            lk.name = name;
-            lk.template_path = tmpl;
-            lk.threshold = thresh;
-            lk.refractory_ms = 2000;
-            if (!lk.templates.load(lk.template_path)) {
-                fprintf(stderr, "Failed to load templates: %s\n", lk.template_path.c_str());
-                return false;
-            }
-            keywords.push_back(std::move(lk));
-            return true;
-        };
-        if (!add_kw("hey_jarvis", "models/templates/hey_jarvis.bin")) return 1;
-        if (!add_kw("weather",    "models/templates/weather.bin"))    return 1;
+        // Server: Jarvis loads model + templates, pipelines set per-connection in server.cpp
+        std::vector<Keyword> keywords;
+        keywords.push_back({.name = "hey_jarvis",
+                            .template_path = "models/templates/hey_jarvis.bin"});
+        keywords.push_back({.name = "weather",
+                            .template_path = "models/templates/weather.bin"});
 
-        jarvis_server(args.model, args.vad_model, std::move(keywords), args.port);
+        jarvis_server(args.model, args.vad_model, keywords, args.port);
 
     } else if (args.mode == CLIENT) {
+        // Client receives detections from server; server handles weather/TTS
         std::vector<Keyword> keywords;
         keywords.push_back({.name = "hey_jarvis"});
-        if (!args.detect_only) {
-            keywords.push_back({.name = "weather", .pipeline = {fire("./build/weather")}});
-        } else {
-            keywords.push_back({.name = "weather"});
-        }
+        keywords.push_back({.name = "weather"});
 
         jarvis_client(args.server_host, args.port, keywords);
 

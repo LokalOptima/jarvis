@@ -20,11 +20,6 @@
 #include <thread>
 #include <unistd.h>
 
-// ---- Signal handling ----
-
-static std::atomic<bool> g_running{true};
-static void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
-
 // ---- Jarvis implementation ----
 
 struct Jarvis::Impl {
@@ -38,7 +33,10 @@ Jarvis::Jarvis(const std::string &whisper_model,
     if (!impl->vad.load(vad_model)) {
         throw std::runtime_error("Failed to load VAD model: " + vad_model);
     }
-    std::cout << "VAD loaded: " << vad_model << std::endl;
+    std::cout << "    VAD loaded: " << vad_model << std::endl;
+
+    // Suppress verbose whisper model loading output
+    whisper_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
 
     struct whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = false;
@@ -48,6 +46,7 @@ Jarvis::Jarvis(const std::string &whisper_model,
     }
     whisper_set_encoder_only(impl->ctx, true);
     std::cout << "Whisper loaded: " << whisper_model << std::endl;
+    std::cout << "------------------------------------" << std::endl;
 }
 
 Jarvis::~Jarvis() {
@@ -65,16 +64,36 @@ void Jarvis::add_keyword(Keyword kw) {
     }
     int total = 0;
     for (const auto &t : lk.templates.items) total += t.n_frames;
-    std::cout << "  " << lk.name << ": "
-              << lk.templates.items.size() << " template(s), " << total << " frames"
-              << (kw.pipeline.empty() ? "" : " [pipeline]") << std::endl;
+    std::cout << "  " << lk.name << ": " << total << " frames" << std::endl;
+    for (const auto &step : kw.pipeline) {
+        std::cout << "    -> " << step.desc << std::endl;
+    }
+    std::cout << std::endl;
     pipelines.push_back(std::move(kw.pipeline));
     record_follow_ups.push_back(kw.record_follow_up);
     impl->keywords.push_back(std::move(lk));
 }
 
 void Jarvis::stop() {
-    g_running = false;
+    m_running = false;
+}
+
+void Jarvis::set_pipeline(const std::string &name, std::vector<PipeStep> pipe) {
+    for (size_t i = 0; i < impl->keywords.size(); i++) {
+        if (impl->keywords[i].name == name) {
+            pipelines[i] = std::move(pipe);
+            return;
+        }
+    }
+}
+
+void Jarvis::set_record_follow_up(const std::string &name, bool val) {
+    for (size_t i = 0; i < impl->keywords.size(); i++) {
+        if (impl->keywords[i].name == name) {
+            record_follow_ups[i] = val;
+            return;
+        }
+    }
 }
 
 // ---- WAV file writing ----
@@ -114,7 +133,8 @@ static bool save_wav(const std::string &path, const float *pcm, int n_samples) {
 // ---- Post-detection audio recording ----
 
 static std::string record_until_silence(
-    std::shared_ptr<audio_async> audio, SileroVad &vad, int silence_timeout_ms)
+    std::shared_ptr<audio_async> audio, SileroVad &vad, int silence_timeout_ms,
+    const std::atomic<bool> &running)
 {
     const int slide_ms = JARVIS_SLIDE_MS;
     const int max_record_ms = 30000;  // safety cap: 30 seconds
@@ -125,7 +145,7 @@ static std::string record_until_silence(
 
     std::cout << "  Recording..." << std::flush;
 
-    while (g_running && silence_ms < silence_timeout_ms && total_ms < max_record_ms) {
+    while (running && silence_ms < silence_timeout_ms && total_ms < max_record_ms) {
         std::this_thread::sleep_for(std::chrono::milliseconds(slide_ms));
 
         audio->get(slide_ms, chunk);
@@ -164,30 +184,42 @@ static std::string record_until_silence(
 // ---- Main detection loop ----
 
 void Jarvis::listen() {
-    if (impl->keywords.empty()) {
-        std::cerr << "No keywords registered" << std::endl;
-        return;
-    }
-
-    std::signal(SIGINT, signal_handler);
+    // Local mode: create SDL2 audio, install SIGINT handler, delegate to listen(audio)
+    static Jarvis *s_instance = nullptr;
+    s_instance = this;
+    std::signal(SIGINT, [](int) { if (s_instance) s_instance->stop(); });
     std::signal(SIGCHLD, SIG_IGN);
-    g_running = true;
 
     auto audio = std::make_shared<audio_async>(static_cast<int>(JARVIS_BUFFER_SEC * 1000));
     audio->init(-1, JARVIS_SAMPLE_RATE);
     audio->resume();
 
+    listen(audio);
+
+    std::cout << "\nStopped." << std::endl;
+}
+
+void Jarvis::listen(std::shared_ptr<audio_async> audio) {
+    if (impl->keywords.empty()) {
+        std::cerr << "No keywords registered" << std::endl;
+        return;
+    }
+
+    m_running = true;
+    impl->vad.reset();
+
     // Wait for the audio buffer to fill, showing progress
     {
         const int steps = 20;
         const int step_ms = (int)(JARVIS_BUFFER_SEC * 1000) / steps;
-        for (int i = 1; i <= steps && g_running; i++) {
+        for (int i = 1; i <= steps && m_running; i++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
             render_bar("buffering", (float)i / steps, 1.0f, 0, true);
         }
         std::cerr << "\r\033[K" << std::flush;
     }
 
+    if (on_ready) on_ready();
     std::cout << "Listening... (" << impl->keywords.size() << " keyword(s), Ctrl+C to stop)" << std::endl;
 
     DetectScratch scratch;
@@ -199,7 +231,7 @@ void Jarvis::listen() {
     int refractory_total = 0;
     float default_thr = impl->keywords[0].threshold;
 
-    while (g_running) {
+    while (m_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(JARVIS_SLIDE_MS));
 
         if (refractory > 0) {
@@ -244,6 +276,8 @@ void Jarvis::listen() {
             std::cout << "  [" << time_buf << "] " << kw.name
                       << "  sim=" << det.score << std::endl;
 
+            if (on_detect) on_detect(kw.name, det.score);
+
             impl->vad.reset();
             audio->clear();
 
@@ -251,22 +285,22 @@ void Jarvis::listen() {
             if (!pipe.empty()) {
                 std::string input;
                 if (record_follow_ups[det.keyword_index]) {
-                    input = record_until_silence(audio, impl->vad, 600);
-                } else {
-                    // Pause mic while pipeline runs (avoid picking up TTS output etc.)
+                    input = record_until_silence(audio, impl->vad, 600, m_running);
+                } else if (audio->has_device()) {
+                    // Pause local mic while pipeline runs (avoid picking up TTS output)
                     audio->pause();
+                    input = kw.name;
+                } else {
                     input = kw.name;
                 }
                 if (!input.empty()) run_pipeline(pipe, input);
                 // Resume mic + clear stale audio
                 impl->vad.reset();
-                audio->resume();
+                if (audio->has_device()) audio->resume();
                 audio->clear();
             }
         }
     }
-
-    std::cout << "\nStopped." << std::endl;
 }
 
 // ---- Pipeline execution ----
@@ -291,7 +325,11 @@ static std::string shell_escape(const std::string &s) {
 }
 
 PipeStep transcribe(const std::string &cmd) {
-    return [cmd](const std::string &wav_path) -> std::string {
+    // Extract basename for description
+    std::string name = cmd;
+    auto pos = name.rfind('/');
+    if (pos != std::string::npos) name = name.substr(pos + 1);
+    return {"transcribe(" + name + ")", [cmd](const std::string &wav_path) -> std::string {
         std::string full = cmd + " " + wav_path + " 2>/dev/null";
         FILE *pipe = popen(full.c_str(), "r");
         if (!pipe) return "";
@@ -305,44 +343,44 @@ PipeStep transcribe(const std::string &cmd) {
         }
         pclose(pipe);
         return last;
-    };
+    }};
 }
 
 PipeStep print_step() {
-    return [](const std::string &text) -> std::string {
+    return {"print", [](const std::string &text) -> std::string {
         std::cout << "  > " << text << std::endl;
         return text;
-    };
+    }};
 }
 
 PipeStep tmux_type() {
-    return [](const std::string &text) -> std::string {
+    return {"?tmux_type", [](const std::string &text) -> std::string {
         std::string cmd = "tmux send-keys -l -- '" + shell_escape(text) + "' 2>/dev/null";
         system(cmd.c_str());
         return text;
-    };
+    }};
 }
 
 PipeStep fire(const std::string &cmd) {
-    return [cmd](const std::string &) -> std::string {
+    return {"fire(" + cmd + ")", [cmd](const std::string &) -> std::string {
         pid_t pid = fork();
         if (pid == 0) {
             execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
             _exit(127);
         }
         return "";  // stop pipeline — command runs async
-    };
+    }};
 }
 
 PipeStep run(const std::string &cmd) {
-    return [cmd](const std::string &input) -> std::string {
+    return {"run(" + cmd + ")", [cmd](const std::string &input) -> std::string {
         system(cmd.c_str());
         return input;
-    };
+    }};
 }
 
 PipeStep shell_pipe(const std::string &cmd) {
-    return [cmd](const std::string &input) -> std::string {
+    return {"pipe(" + cmd + ")", [cmd](const std::string &input) -> std::string {
         std::string full = "echo '" + shell_escape(input) + "' | " + cmd + " 2>/dev/null";
         FILE *pipe = popen(full.c_str(), "r");
         if (!pipe) return "";
@@ -352,5 +390,5 @@ PipeStep shell_pipe(const std::string &cmd) {
         pclose(pipe);
         while (!output.empty() && output.back() == '\n') output.pop_back();
         return output;
-    };
+    }};
 }

@@ -12,6 +12,16 @@ audio_async::~audio_async() {
     if (m_dev_id_in) SDL_CloseAudioDevice(m_dev_id_in);
 }
 
+bool audio_async::init_push(int sample_rate) {
+    m_sample_rate = sample_rate;
+    m_audio.resize((m_sample_rate * m_len_ms) / 1000, 0.0f);
+    return true;
+}
+
+bool audio_async::has_device() const {
+    return m_dev_id_in != 0;
+}
+
 bool audio_async::init(int capture_id, int sample_rate) {
     // Prevent SDL from probing X11/XCB when we only need audio
     SDL_SetHint(SDL_HINT_VIDEODRIVER, "dummy");
@@ -55,54 +65,58 @@ bool audio_async::init(int capture_id, int sample_rate) {
 }
 
 bool audio_async::resume() {
-    if (!m_dev_id_in || m_running) return false;
-    SDL_PauseAudioDevice(m_dev_id_in, 0);
+    if (m_running) return false;
+    if (m_dev_id_in) SDL_PauseAudioDevice(m_dev_id_in, 0);
     m_running = true;
     return true;
 }
 
 bool audio_async::pause() {
-    if (!m_dev_id_in || !m_running) return false;
-    SDL_PauseAudioDevice(m_dev_id_in, 1);
+    if (!m_running) return false;
+    if (m_dev_id_in) SDL_PauseAudioDevice(m_dev_id_in, 1);
     m_running = false;
     return true;
 }
 
 bool audio_async::clear() {
-    if (!m_dev_id_in || !m_running) return false;
+    if (m_audio.empty() || !m_running) return false;
     std::lock_guard<std::mutex> lock(m_mutex);
     m_audio_pos = 0;
     m_audio_len = 0;
     return true;
 }
 
-void audio_async::callback(uint8_t *stream, int len) {
+void audio_async::push(const float *samples, int n) {
     if (!m_running) return;
 
-    size_t n_samples = len / sizeof(float);
+    size_t n_samples = (size_t)n;
     if (n_samples > m_audio.size()) {
+        samples += (n_samples - m_audio.size());
         n_samples = m_audio.size();
-        stream += (len - (n_samples * sizeof(float)));
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
 
     if (m_audio_pos + n_samples > m_audio.size()) {
         size_t n0 = m_audio.size() - m_audio_pos;
-        memcpy(&m_audio[m_audio_pos], stream, n0 * sizeof(float));
-        memcpy(&m_audio[0], stream + n0 * sizeof(float), (n_samples - n0) * sizeof(float));
+        memcpy(&m_audio[m_audio_pos], samples, n0 * sizeof(float));
+        memcpy(&m_audio[0], samples + n0, (n_samples - n0) * sizeof(float));
         m_audio_pos = (m_audio_pos + n_samples) % m_audio.size();
         m_audio_len = m_audio.size();
     } else {
-        memcpy(&m_audio[m_audio_pos], stream, n_samples * sizeof(float));
+        memcpy(&m_audio[m_audio_pos], samples, n_samples * sizeof(float));
         m_audio_pos = (m_audio_pos + n_samples) % m_audio.size();
         m_audio_len = std::min(m_audio_len + n_samples, m_audio.size());
     }
 }
 
+void audio_async::callback(uint8_t *stream, int len) {
+    push(reinterpret_cast<const float *>(stream), len / sizeof(float));
+}
+
 void audio_async::get(int ms, std::vector<float> &result) {
     result.clear();
-    if (!m_dev_id_in || !m_running) return;
+    if (m_audio.empty() || !m_running) return;
 
     std::lock_guard<std::mutex> lock(m_mutex);
 
