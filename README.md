@@ -2,74 +2,106 @@
 
 A CPU-only, privacy-first wake word detector that responds to a specific person saying a specific phrase. No cloud, no training data, no GPU. Enroll with a handful of recordings, and it runs forever on a single core.
 
-Uses **Whisper Tiny** as a frozen feature extractor and **subsequence DTW** for template matching. The Whisper encoder turns audio into 384-dimensional frame sequences; DTW finds the best-matching region within a sliding window. CMVN and DBA collapse 10-20 enrollment recordings into a single robust template.
+Supports multiple keywords, composable action pipelines, and a client/server split for running detection on a remote machine.
+
+Uses **Whisper Tiny** as a frozen feature extractor and **subsequence DTW** for template matching. The Whisper encoder turns audio into 384-dimensional frame sequences; DTW finds the best-matching region within a sliding window. **Silero VAD** gates the expensive detection path so encoding only runs when someone is speaking.
 
 ## Architecture
 
 ```
-Enrollment (Python, runs once):
+Enrollment (Python, runs once per keyword):
 
-  "hey Jarvis" x 18  →  Whisper Turbo (word timestamps)  →  clip extraction
-                         →  Whisper Tiny encoder  →  [T, 384] features per clip
-                         →  skip onset frames  →  CMVN per clip
-                         →  DBA (18 clips → 1 template)  →  L2-normalize
-                         →  templates.bin
+  "hey jarvis" x 15  →  Web UI: record, trim, review clips
+                      →  C++ encoder  →  [T, 384] features per clip
+                      →  skip onset frames  →  CMVN per clip
+                      →  DBA (N clips → 1 template)  →  L2-normalize
+                      →  models/templates/hey_jarvis.bin
 
-Runtime (C++, runs always):
+Local mode (C++, runs always):
 
-  SDL2 mic (16kHz)  →  2s ring buffer  →  energy VAD gate
-                    →  mel spectrogram  →  Whisper Tiny encode (~15ms)
+  SDL2 mic (16kHz)  →  2s ring buffer  →  200ms slide
+                    →  Silero VAD gate (speech?)
+                    →  mel spectrogram  →  Whisper Tiny encode (~10ms)
                     →  skip onset frames  →  CMVN
-                    →  subsequence DTW vs template  →  score > threshold?
-                    →  DETECTED
+                    →  subsequence DTW vs all keyword templates
+                    →  score > threshold?  →  DETECTED
+                    →  optional: record follow-up until silence
+                    →  pipeline: transcribe → print → tmux_type
+
+Server/client mode:
+
+  Client: SDL2 mic  →  200ms audio chunks  →  TCP  →  Server
+  Server: ring buffer  →  same detection loop  →  MSG_DETECT back
+                       →  pipeline execution  →  MSG_RESPONSE (text + audio)
 ```
 
-The enrollment pipeline uses **Whisper Turbo** (a much larger model) to find wake word timestamps with word-level precision, then **Whisper Tiny** to extract the features that the runtime will match against. The runtime only needs Tiny.
-
 ## Key Techniques
+
+**Silero VAD** — A ported Silero v5 voice activity detector (LSTM-based, ~300K params) runs on every 200ms slide. Detection only fires when speech is present, keeping CPU usage near zero during silence.
 
 **CMVN** (Cepstral Mean and Variance Normalization) — Subtracts per-dimension mean and divides by std across all frames in a window. Removes the shared "average speech" direction that makes all utterances look similar in Whisper's feature space. This is the single biggest improvement: discrimination gap 0.22 → 0.39.
 
 **DBA** (Dynamic Barycenter Averaging) — Merges N enrollment templates into one representative template by iteratively aligning all templates via DTW and averaging the aligned frames. Captures the essential temporal pattern while smoothing per-utterance variation. Also makes runtime matching N times faster.
 
-**Subsequence DTW** — Unlike full DTW, the template can match *anywhere* within the input window. The template must be fully consumed, but it can start and end at any position. Two-row sliding window implementation: O(n*m) time, O(m) space.
+**Subsequence DTW** — Unlike full DTW, the template can match *anywhere* within the input window. The template must be fully consumed, but it can start and end at any position. Two-row sliding window implementation: O(n\*m) time, O(m) space.
 
 **Step penalty** — Non-diagonal DTW transitions (insertion/deletion) incur a 0.1 penalty, discouraging pathological warping where one frame stretches to cover a long region.
 
 **Onset skip** — Whisper's first 2 encoder frames encode "start of audio" regardless of content (cosine similarity 0.97+ across all inputs). Skipping them removes this free match that inflates all scores.
 
-**Variable-length encoding** — Whisper.cpp was designed for 30-second chunks (1500 frames). We set `exp_n_audio_ctx` to the actual frame count (~100 for 2 seconds), encoding only what's needed. ~15x less work per cycle.
+**Variable-length encoding** — Whisper.cpp was designed for 30-second chunks (1500 frames). We set `whisper_set_audio_ctx()` to the actual frame count (~100 for 2 seconds), encoding only what's needed. ~15x less work per cycle.
+
+**Composable pipelines** — Each keyword carries a chain of `PipeStep` functions (string in, string out). Built-in steps: `transcribe()` (run STT on recorded audio), `print_step()`, `tmux_type()` (type into active tmux pane), `run()`, `fire()` (fork async), `shell_pipe()`. Empty return stops the chain.
 
 ## Project Structure
 
 ```
 src/
-  jarvis.cpp          C++ runtime — the always-on detector (~370 lines)
-  audio_async.cpp/hpp  SDL2 audio ring buffer (from whisper.cpp examples)
+  main.cpp              CLI entry — mode dispatch (local/server/client), keyword config
+  jarvis.cpp/h          Detection engine — listen loop, pipelines, follow-up recording
+  detect.cpp/h          Core detection — mel, encode, CMVN, subsequence DTW, scoring
+  vad.cpp/h             Silero VAD — pure C implementation (~300K params)
+  vad_ggml.cpp/h        Silero VAD — ggml graph-based variant
+  server.cpp/h          TCP server — per-connection detection, response streaming
+  client.cpp/h          TCP client — audio streaming, detection display, audio playback
+  net.h                 TCP framing protocol, dual-stack sockets
+  audio_async.cpp/hpp   Ring buffer — SDL2 capture mode + push mode (for server)
+  whisper.cpp/h         Vendored whisper.cpp (encoder-only, custom embedding extraction)
+  encode.cpp            CLI: extract encoder embeddings from WAV files (used by enroll)
+  weather.cpp/hpp       Weather fetch (wttr.in) + TTS via rokoko
+  bench.cpp             Mel + encode latency benchmark
 
 jarvis/
-  __init__.py          Shared constants (sample rate, paths, thresholds)
-  features.py          Whisper Tiny feature extraction (Python, variable-length + layer selection)
-  enroll.py            Enrollment pipeline: record → detect → extract clips → build templates
-  review.py            Web UI for enrollment: record, upload, review clips, build templates
-  dtw.py               Shared DTW utilities: cmvn, dba, subdtw, l2norm
-  ablation.py          Ablation study — tests all improvement combinations
+  __init__.py           Constants (sample rate, paths, thresholds), keyword utilities
+  features.py           Feature extraction via C++ encode binary (subprocess)
+  enroll.py             Web UI: record, trim, review clips, build templates
+  dtw.py                DTW, DBA, CMVN, cosine distance (shared Python algorithms)
+
+scripts/
+  ablation.py           Ablation study — sweep feature combinations, report gaps
+  export_silero.py      Export Silero VAD weights from ONNX to binary format
+  silero_ref.py         Validate C++ VAD against ONNX reference
 
 lib/
-  whisper.cpp/         Vendored, stripped whisper.cpp (encoder-only, 2859 lines from 7400)
-                       Patched with whisper_encoder_output() and whisper_set_audio_ctx()
+  ggml/                 Vendored ggml (CPU-only tensor library)
+  json.hpp              nlohmann/json (single-header)
 
-models/                (gitignored)
-  ggml-tiny.bin        Whisper Tiny GGML weights for C++ runtime
-  templates.bin        Built template (1 DBA template, ~50KB)
+models/                 (gitignored)
+  ggml-tiny.bin         Whisper Tiny GGML weights
+  silero_vad.bin        Silero VAD weights
+  templates/            Per-keyword DBA templates
+    hey_jarvis.bin
+    weather.bin
 
-data/                  (gitignored)
-  clips/               Extracted wake word clips (~18 WAV files)
-  positive.wav         Test recording with wake word (for ablation)
-  negative.wav         Test recording without wake word (for ablation)
-  background.wav       Test recording of room noise (for ablation)
+data/                   (gitignored)
+  clips/                Per-keyword enrollment clips
+    hey_jarvis/
+    weather/
+  positive.wav          Test recording with wake word (for ablation)
+  negative.wav          Test recording without wake word (for ablation)
+  background.wav        Test recording of room noise (for ablation)
 
-blog/                  Technical writeups of the development process
+blog/                   Technical writeups of the development process (8 posts)
 ```
 
 ## Prerequisites
@@ -77,69 +109,88 @@ blog/                  Technical writeups of the development process
 - **uv** — Python package manager
 - **cmake** + C++17 compiler
 - **SDL2** development libraries (`libsdl2-dev` on Debian/Ubuntu)
-- **ffmpeg** — required by openai-whisper for audio format conversion
 
 ```sh
 # Debian/Ubuntu
-sudo apt install cmake libsdl2-dev ffmpeg
+sudo apt install cmake libsdl2-dev
 
-# The Whisper Tiny GGML model (40MB)
+# Whisper Tiny GGML model (40MB)
 uvx hf download ggerganov/whisper.cpp ggml-tiny.bin --local-dir models
 ```
+
+The Silero VAD model (`models/silero_vad.bin`) is exported from ONNX via `uv run python scripts/export_silero.py`.
 
 ## Quick Start
 
 ### 1. Enroll
 
-Record yourself saying the wake word 10-20 times:
-
 ```sh
-make enroll                              # live mic recording
-# or
-uv run python -m jarvis.enroll file.wav  # from a pre-recorded file
+make enroll
 ```
 
-Whisper Turbo detects each utterance and extracts individual clips to `data/clips/`.
+Opens a web UI at `localhost:8457`. Record yourself saying the wake word 10-20 times, trim each clip with the waveform editor, and save. Clips are stored in `data/clips/<keyword>/`.
 
-### 2. Review
+### 2. Build Templates
 
 ```sh
-make review
+make templates
 ```
 
-Opens a web UI at `localhost:8457`. Listen to each clip, delete bad ones (cut off, noisy, misdetections). You can also record and upload directly from the browser.
+Extracts features from all clips, runs CMVN + DBA, and writes per-keyword templates to `models/templates/`.
 
-### 3. Build Templates
-
-```sh
-make build
-```
-
-Runs CMVN + DBA on the clips and writes `models/templates.bin`.
-
-### 4. Compile and Run
+### 3. Run
 
 ```sh
-make compile
 make run
 ```
 
-The detector prints a colored score bar to stderr and detection events to stdout:
+Compiles (if needed) and starts the detector. The terminal shows a colored score bar and detection events:
 
 ```
   ████████████░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  0.12   8ms
-  [14:23:05] DETECTED  sim=0.58
+  [14:23:05] DETECTED hey_jarvis  sim=0.58
 ```
 
 Green fill = score below threshold. Red = above. Yellow `│` = threshold marker.
+
+### Server/Client Mode
+
+Run detection on a remote machine, stream audio from a lightweight client:
+
+```sh
+# On the server
+make server
+
+# On the client
+make client
+./build/jarvis-client SERVER_HOST
+```
+
+The client streams 200ms audio chunks over TCP. The server runs the full detection pipeline and sends back detection events and audio responses.
 
 ### CLI Options
 
 ```
 ./build/jarvis [options]
-  -m <path>   Whisper model      (default: models/ggml-tiny.bin)
-  -e <path>   Template file      (default: models/templates.bin)
-  -t <float>  Detection threshold (default: 0.35)
+  --model PATH       Whisper model      (default: models/ggml-tiny.bin)
+  --vad PATH         VAD model          (default: models/silero_vad.bin)
+  --detect-only      Log detections without running pipelines
+  --server           Server mode: listen for audio over TCP
+  --client HOST      Client mode: stream mic to HOST
+  --port PORT        TCP port           (default: 7287)
+  -h, --help         Show help
+```
+
+### Makefile Targets
+
+```
+make run              Local detection (compiles if needed)
+make run-detect       Detection-only mode (no pipelines)
+make server           Start TCP server
+make client           Build lightweight client binary
+make enroll           Open enrollment web UI
+make templates        Build templates from clips
+make clean            Remove build directory
 ```
 
 ## Ablation Results
@@ -155,13 +206,14 @@ Tested against three recordings: positive (contains wake word), negative (speech
 | + DBA (18 → 1 template) | 0.594 | 0.146 | 0.088 | 0.449 |
 | **+ layer 3** | **0.582** | **0.117** | **0.058** | **0.465** |
 
-Run `uv run python -m jarvis.ablation` to reproduce.
+Run `uv run python scripts/ablation.py` to reproduce.
 
 ## Runtime Performance
 
-On a modern x86 CPU, the hot loop takes ~15-20ms per 200ms cycle:
+On a modern x86 CPU, the hot loop takes ~10-15ms per 200ms cycle:
+- Silero VAD: <1ms (512-sample frames)
 - Mel spectrogram: ~2ms
-- Whisper Tiny encode: ~12-15ms (variable-length, ~100 frames instead of 1500)
-- CMVN + DTW + render: <1ms
+- Whisper Tiny encode: ~8-12ms (variable-length, ~100 frames instead of 1500)
+- CMVN + DTW: <1ms
 
-The detector uses ~150MB RAM (Whisper Tiny model + SDL2 audio buffer).
+The detector uses ~150MB RAM (Whisper Tiny model + Silero VAD + SDL2 audio buffer). Run `./build/bench models/ggml-tiny.bin` to measure on your hardware.
