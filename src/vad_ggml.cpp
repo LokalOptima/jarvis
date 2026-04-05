@@ -71,6 +71,7 @@ bool SileroVad::load(const std::string &path) {
     for (auto &ti : infos) tensors.push_back(make_tensor(ti));
 
     backend = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(backend, 1);  // single-thread: no dispatch overhead on tiny graph
     buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
 
     // Second pass: load weight data
