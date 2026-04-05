@@ -2,7 +2,7 @@
  * jarvis.cpp - Wake word detection engine (local mode).
  *
  * Pipeline:
- *   SDL2 mic capture → ring buffer → detect_once() → callback
+ *   SDL2 mic capture → ring buffer → detect_once() → pipeline steps
  */
 
 #include "jarvis.h"
@@ -67,9 +67,8 @@ void Jarvis::add_keyword(Keyword kw) {
     for (const auto &t : lk.templates.items) total += t.n_frames;
     std::cout << "  " << lk.name << ": "
               << lk.templates.items.size() << " template(s), " << total << " frames"
-              << (kw.callback ? " [callback]" : "") << std::endl;
-    // Store callback + follow-up flag separately (not in LoadedKeyword which is shared with server)
-    callbacks.push_back(kw.callback);
+              << (kw.pipeline.empty() ? "" : " [pipeline]") << std::endl;
+    pipelines.push_back(std::move(kw.pipeline));
     record_follow_ups.push_back(kw.record_follow_up);
     impl->keywords.push_back(std::move(lk));
 }
@@ -162,6 +161,8 @@ static std::string record_until_silence(
     return path;
 }
 
+// ---- Main detection loop ----
+
 void Jarvis::listen() {
     if (impl->keywords.empty()) {
         std::cerr << "No keywords registered" << std::endl;
@@ -246,55 +247,110 @@ void Jarvis::listen() {
             impl->vad.reset();
             audio->clear();
 
-            if (record_follow_ups[det.keyword_index]) {
-                // Record until silence, then call back with WAV path
-                std::string wav = record_until_silence(audio, impl->vad, 1000);
+            const auto &pipe = pipelines[det.keyword_index];
+            if (!pipe.empty()) {
+                std::string input;
+                if (record_follow_ups[det.keyword_index]) {
+                    input = record_until_silence(audio, impl->vad, 600);
+                } else {
+                    // Pause mic while pipeline runs (avoid picking up TTS output etc.)
+                    audio->pause();
+                    input = kw.name;
+                }
+                if (!input.empty()) run_pipeline(pipe, input);
+                // Resume mic + clear stale audio
                 impl->vad.reset();
+                audio->resume();
                 audio->clear();
-                auto &cb = callbacks[det.keyword_index];
-                if (cb && !wav.empty()) cb(wav, det.score);
-            } else {
-                auto &cb = callbacks[det.keyword_index];
-                if (cb) cb(kw.name, det.score);
             }
-
-            refractory_total = kw.refractory_ms / JARVIS_SLIDE_MS;
-            refractory = refractory_total;
         }
     }
 
     std::cout << "\nStopped." << std::endl;
 }
 
-// ---- run_command helper ----
+// ---- Pipeline execution ----
 
-std::function<void(const std::string &, float)> run_command(const std::string &cmd) {
-    return [cmd](const std::string &, float) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
-            _exit(127);
-        } else if (pid < 0) {
-            perror("fork");
-        }
-    };
+void run_pipeline(const std::vector<PipeStep> &steps, const std::string &input) {
+    std::string val = input;
+    for (const auto &step : steps) {
+        if (val.empty()) break;
+        val = step(val);
+    }
 }
 
-std::function<void(const std::string &, float)> run_transcribe(const std::string &cmd) {
-    return [cmd](const std::string &wav_path, float) {
+// ---- Built-in pipeline steps ----
+
+static std::string shell_escape(const std::string &s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    return out;
+}
+
+PipeStep transcribe(const std::string &cmd) {
+    return [cmd](const std::string &wav_path) -> std::string {
         std::string full = cmd + " " + wav_path + " 2>/dev/null";
         FILE *pipe = popen(full.c_str(), "r");
-        if (!pipe) { perror("popen"); return; }
-        std::string last_line;
+        if (!pipe) return "";
+        std::string last;
         char buf[4096];
         while (fgets(buf, sizeof(buf), pipe)) {
             std::string line(buf);
             while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
                 line.pop_back();
-            if (!line.empty()) last_line = line;
+            if (!line.empty()) last = line;
         }
         pclose(pipe);
-        if (!last_line.empty())
-            std::cout << "  > " << last_line << std::endl;
+        return last;
+    };
+}
+
+PipeStep print_step() {
+    return [](const std::string &text) -> std::string {
+        std::cout << "  > " << text << std::endl;
+        return text;
+    };
+}
+
+PipeStep tmux_type() {
+    return [](const std::string &text) -> std::string {
+        std::string cmd = "tmux send-keys -l -- '" + shell_escape(text) + "' 2>/dev/null";
+        system(cmd.c_str());
+        return text;
+    };
+}
+
+PipeStep fire(const std::string &cmd) {
+    return [cmd](const std::string &) -> std::string {
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
+            _exit(127);
+        }
+        return "";  // stop pipeline — command runs async
+    };
+}
+
+PipeStep run(const std::string &cmd) {
+    return [cmd](const std::string &input) -> std::string {
+        system(cmd.c_str());
+        return input;
+    };
+}
+
+PipeStep shell_pipe(const std::string &cmd) {
+    return [cmd](const std::string &input) -> std::string {
+        std::string full = "echo '" + shell_escape(input) + "' | " + cmd + " 2>/dev/null";
+        FILE *pipe = popen(full.c_str(), "r");
+        if (!pipe) return "";
+        std::string output;
+        char buf[4096];
+        while (fgets(buf, sizeof(buf), pipe)) output += buf;
+        pclose(pipe);
+        while (!output.empty() && output.back() == '\n') output.pop_back();
+        return output;
     };
 }

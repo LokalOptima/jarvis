@@ -48,10 +48,9 @@ static void receiver_thread(int fd, const std::vector<Keyword> &keywords) {
             std::cout << "  [" << time_buf << "] " << name
                       << "  sim=" << score << std::endl;
 
-            // Find matching keyword and run callback
             for (const auto &kw : keywords) {
-                if (kw.name == name && kw.callback) {
-                    kw.callback(kw.name, score);
+                if (kw.name == name && !kw.pipeline.empty()) {
+                    run_pipeline(kw.pipeline, kw.name);
                     break;
                 }
             }

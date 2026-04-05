@@ -88,31 +88,43 @@ int main(int argc, char **argv) {
         jarvis_server(args.model, args.vad_model, std::move(keywords), args.port);
 
     } else if (args.mode == CLIENT) {
-        // Client: just keywords + callbacks, no model needed
-        auto weather_cb = args.detect_only ? nullptr : run_command("./build/weather");
         std::vector<Keyword> keywords;
         keywords.push_back({.name = "hey_jarvis"});
-        keywords.push_back({.name = "weather", .callback = weather_cb});
+        if (!args.detect_only) {
+            keywords.push_back({.name = "weather", .pipeline = {fire("./build/weather")}});
+        } else {
+            keywords.push_back({.name = "weather"});
+        }
 
         jarvis_client(args.server_host, args.port, keywords);
 
     } else {
-        // Local mode (unchanged)
         Jarvis j(args.model, args.vad_model);
 
-        j.add_keyword({
-            .name = "hey_jarvis",
-            .template_path = "models/templates/hey_jarvis.bin",
-            .callback = args.detect_only ? nullptr : run_transcribe(
-                "flock --shared /tmp/gpu.lock "
-                "/home/lapo/git/LokalOptima/paraketto/paraketto.fp8"),
-            .record_follow_up = true,
-        });
-        j.add_keyword({
-            .name = "weather",
-            .template_path = "models/templates/weather.bin",
-            .callback = args.detect_only ? nullptr : run_command("./build/weather"),
-        });
+        if (args.detect_only) {
+            j.add_keyword({.name = "hey_jarvis",
+                           .template_path = "models/templates/hey_jarvis.bin",
+                           .record_follow_up = true});
+            j.add_keyword({.name = "weather",
+                           .template_path = "models/templates/weather.bin"});
+        } else {
+            j.add_keyword({
+                .name = "hey_jarvis",
+                .template_path = "models/templates/hey_jarvis.bin",
+                .pipeline = {
+                    transcribe("flock --shared /tmp/gpu.lock "
+                               "/home/lapo/git/LokalOptima/paraketto/paraketto.fp8"),
+                    print_step(),
+                    tmux_type(),
+                },
+                .record_follow_up = true,
+            });
+            j.add_keyword({
+                .name = "weather",
+                .template_path = "models/templates/weather.bin",
+                .pipeline = {run("./build/weather")},
+            });
+        }
 
         j.listen();
     }
