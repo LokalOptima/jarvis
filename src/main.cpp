@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <string>
 
 enum Mode { MODE_LOCAL, MODE_SERVER, MODE_CLIENT };
@@ -25,6 +26,7 @@ struct Args {
     std::string vad_model = "models/silero_vad.bin";
     Mode mode = MODE_LOCAL;
     std::string server_host;
+    std::string ding = "data/beep.wav";
     int port = JARVIS_PORT;
 };
 
@@ -42,6 +44,10 @@ static Args parse_args(int argc, char **argv) {
             args.server_host = argv[++i];
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             args.port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--ding") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "none") == 0) args.ding = "";
+            else args.ding = std::string("data/") + v + ".wav";
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             fprintf(stderr, "Usage: %s [options]\n"
                             "  --model PATH       whisper model (default: models/ggml-tiny.bin)\n"
@@ -49,6 +55,7 @@ static Args parse_args(int argc, char **argv) {
                             "  --server           server mode: listen for audio over TCP\n"
                             "  --client HOST      client mode: stream mic to HOST\n"
                             "  --port PORT        TCP port (default: %d)\n"
+                            "  --ding NAME        detection sound: beep, bling, none (default: beep)\n"
                             "  -h, --help         show this help\n", argv[0], JARVIS_PORT);
             exit(0);
         } else {
@@ -90,7 +97,9 @@ int main(int argc, char **argv) {
 
     } else {
         Jarvis j(args.model, args.vad_model);
+        if (!args.ding.empty()) j.set_ding(args.ding);
 
+        std::cout << "------------------------------------\nKeywords:" << std::endl;
         j.on("hey_jarvis", "models/templates/hey_jarvis.bin", {
             transcribe(PARAKETTO),
             print(""),

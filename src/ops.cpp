@@ -139,7 +139,7 @@ Step transcribe(const std::string &params) {
         std::vector<float> chunk;
         std::future<std::string> pending;
 
-        std::cout << "  Recording..." << std::flush;
+        std::cout << "  Recording..." << std::endl;
 
         while (running()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(slide_ms));
@@ -172,8 +172,6 @@ Step transcribe(const std::string &params) {
                 if (cooldown_ms <= 0) {
                     // Silence timeout: commit
                     msg.text = pending.valid() ? pending.get() : "";
-                    float dur = (float)recording.size() / JARVIS_SAMPLE_RATE;
-                    std::cout << " " << dur << "s" << std::endl;
                     return;
                 }
             } else {

@@ -198,6 +198,7 @@ void jarvis_server(const std::string &model_path,
         shutdown(client_fd, SHUT_RDWR);
         if (receiver.joinable()) receiver.join();
         close(client_fd);
+        teardown_scroll_region();
         std::cout << "Client disconnected" << std::endl;
     }
 

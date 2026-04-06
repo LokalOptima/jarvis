@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 // ---- Templates ----
 
@@ -180,6 +182,28 @@ DetectResult detect_once(
 
 // ---- Terminal bar ----
 
+static int g_bar_row = 0;  // 0 = not pinned (legacy \r mode)
+
+void setup_scroll_region() {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) < 0) return;
+    g_bar_row = ws.ws_row;
+    // APT-style: newline, save cursor (DECSC), set scroll region, restore (DECRC), up 1
+    fprintf(stdout, "\n\0337\033[1;%dr\0338\033[1A", ws.ws_row - 1);
+    fflush(stdout);
+}
+
+void teardown_scroll_region() {
+    if (g_bar_row <= 0) return;
+    struct winsize ws;
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
+    // Restore full scroll region, jump to bar row, clear it, restore cursor
+    fprintf(stdout, "\0337\033[1;%dr\033[%d;1H\033[2K\0338",
+            ws.ws_row, ws.ws_row);
+    fflush(stdout);
+    g_bar_row = 0;
+}
+
 void render_bar(const char *name, float score, float threshold, int ms, bool silent) {
     static char buf[768];
     char *p = buf;
@@ -188,7 +212,13 @@ void render_bar(const char *name, float score, float threshold, int ms, bool sil
     constexpr int W = 36;
     int thr = std::max(0, std::min(W - 1, (int)(threshold * W)));
 
-    *p++ = '\r'; *p++ = ' '; *p++ = ' ';
+    if (g_bar_row > 0) {
+        // DECSC + jump to pinned row
+        p += std::snprintf(p, 32, "\0337\033[%d;1H", g_bar_row);
+    } else {
+        *p++ = '\r';
+    }
+    *p++ = ' '; *p++ = ' ';
 
     int nlen = (int)strlen(name);
     int copy = std::min(nlen, NAME_W);
@@ -231,5 +261,12 @@ void render_bar(const char *name, float score, float threshold, int ms, bool sil
         p += std::snprintf(p, 64, "\033[0m  %4.2f  %3dms\033[K", score, ms);
     }
 
-    fwrite(buf, 1, p - buf, stderr);
+    if (g_bar_row > 0) {
+        // DECRC: restore cursor to scroll region
+        *p++ = '\033'; *p++ = '8';
+    }
+
+    FILE *out = g_bar_row > 0 ? stdout : stderr;
+    fwrite(buf, 1, p - buf, out);
+    fflush(out);
 }

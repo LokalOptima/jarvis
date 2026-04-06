@@ -86,5 +86,7 @@ DetectResult detect_once(
     const float *pcm, int n_samples,
     DetectScratch &scratch);
 
-// Terminal bar visualization.
+// Terminal bar visualization (pinned to bar_row when set).
 void render_bar(const char *name, float score, float threshold, int ms, bool silent);
+void setup_scroll_region();   // pin bar at current cursor row, scroll logs below
+void teardown_scroll_region();

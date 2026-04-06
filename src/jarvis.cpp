@@ -15,6 +15,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -25,6 +26,7 @@ struct Jarvis::Impl {
     struct whisper_context *ctx = nullptr;
     SileroVad vad;
     std::vector<LoadedKeyword> keywords;
+    std::vector<uint8_t> ding_wav;
 };
 
 Jarvis::Jarvis(const std::string &whisper_model,
@@ -44,7 +46,6 @@ Jarvis::Jarvis(const std::string &whisper_model,
     }
     whisper_set_encoder_only(impl->ctx, true);
     std::cout << "Whisper loaded: " << whisper_model << std::endl;
-    std::cout << "------------------------------------" << std::endl;
 
     // Set engine singletons so ops can access VAD and running flag
     set_engine_singletons(&impl->vad, &m_running);
@@ -93,6 +94,19 @@ void Jarvis::on(const std::string &name, const std::string &template_path,
     std::cout << std::endl;
 }
 
+void Jarvis::set_ding(const std::string &wav_path) {
+    std::ifstream f(wav_path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        std::cerr << "Warning: could not load ding: " << wav_path << std::endl;
+        return;
+    }
+    auto sz = f.tellg();
+    f.seekg(0);
+    impl->ding_wav.resize(sz);
+    f.read(reinterpret_cast<char *>(impl->ding_wav.data()), sz);
+    std::cout << "   Ding loaded: " << wav_path << std::endl;
+}
+
 void Jarvis::stop() {
     m_running = false;
 }
@@ -103,6 +117,7 @@ void Jarvis::listen() {
     static Jarvis *s_instance = nullptr;
     s_instance = this;
     std::signal(SIGINT, [](int) { if (s_instance) s_instance->stop(); });
+    std::signal(SIGWINCH, [](int) { setup_scroll_region(); });
     // No SIGCHLD SIG_IGN — ops use popen/pclose which need default behavior.
     // fire() uses double-fork to avoid zombies.
 
@@ -112,7 +127,8 @@ void Jarvis::listen() {
 
     listen(audio);
 
-    std::cout << "\nStopped." << std::endl;
+    teardown_scroll_region();
+    std::cout << "Stopped." << std::endl;
 }
 
 void Jarvis::listen(std::shared_ptr<audio_async> audio) {
@@ -125,7 +141,8 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
     impl->vad.reset();
 
     if (on_ready) on_ready();
-    std::cout << "Listening... (" << impl->keywords.size() << " keyword(s), Ctrl+C to stop)" << std::endl;
+    std::cout << std::endl;  // blank line before bar
+    setup_scroll_region();
 
     DetectScratch scratch;
     scratch.init();
@@ -170,9 +187,11 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
             auto tt = std::chrono::system_clock::to_time_t(now);
             char time_buf[32];
             std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&tt));
-            std::cerr << "\r\033[K" << std::flush;
             std::cout << "  [" << time_buf << "] " << kw.name
                       << "  sim=" << det.score << std::endl;
+
+            if (!impl->ding_wav.empty())
+                play_wav(impl->ding_wav.data(), impl->ding_wav.size(), false);
 
             if (on_detect) on_detect(kw.name, det.score);
 
