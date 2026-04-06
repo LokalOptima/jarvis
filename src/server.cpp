@@ -2,16 +2,15 @@
  * server.cpp - Jarvis server: receive PCM audio over TCP, run detection via
  * the shared Jarvis engine, send events back to the client.
  *
- * Uses Jarvis with push-mode audio_async: a TCP receiver thread feeds audio
- * into the ring buffer, and Jarvis::listen(audio) runs the same detection
- * loop as local mode, with server-specific pipeline steps that send results
- * back to the client via MSG_RESPONSE.
+ * Receives MSG_PIPELINE from client on connect, resolves step names via OPS
+ * dict, then runs the detection loop. Results are sent back via on_result hook.
+ *
+ * SIGCHLD must NOT be SIG_IGN (popen/pclose needs default behavior).
  */
 
 #include "server.h"
 #include "detect.h"
 #include "net.h"
-#include "weather.hpp"
 #include <audio_async.hpp>
 
 #include <atomic>
@@ -21,47 +20,71 @@
 #include <poll.h>
 #include <thread>
 
+// ---- Wire helpers ----
+
 static bool send_detection(int fd, const std::string &name, float score) {
-    // payload: null-terminated name + float32 score
     std::vector<uint8_t> payload(name.size() + 1 + sizeof(float));
     memcpy(payload.data(), name.c_str(), name.size() + 1);
     memcpy(payload.data() + name.size() + 1, &score, sizeof(float));
     return send_msg(fd, MSG_DETECT, payload.data(), payload.size());
 }
 
+static bool send_result(int fd, const Msg &msg) {
+    // MSG_RESULT: null-terminated keyword + uint32 text_len + text + audio
+    size_t kw_len = msg.keyword.size() + 1;
+    uint32_t text_len = msg.text.size();
+    std::vector<uint8_t> payload(kw_len + sizeof(text_len) + text_len + msg.audio.size());
+    size_t pos = 0;
+    memcpy(payload.data() + pos, msg.keyword.c_str(), kw_len); pos += kw_len;
+    memcpy(payload.data() + pos, &text_len, sizeof(text_len)); pos += sizeof(text_len);
+    if (text_len > 0) { memcpy(payload.data() + pos, msg.text.data(), text_len); pos += text_len; }
+    if (!msg.audio.empty()) { memcpy(payload.data() + pos, msg.audio.data(), msg.audio.size()); }
+    return send_msg(fd, MSG_RESULT, payload.data(), payload.size());
+}
+
 static bool send_status(int fd, uint8_t status) {
     return send_msg(fd, MSG_STATUS, &status, 1);
 }
 
-// ---- Server-specific pipeline steps ----
+// ---- Pipeline resolution from MSG_PIPELINE ----
 
-// Send transcribed text to client via MSG_RESPONSE (text only, no WAV)
-static PipeStep send_text_to_client(int fd) {
-    return {"send_to_client", [fd](const std::string &text) -> std::string {
-        uint32_t text_len = text.size();
-        std::vector<uint8_t> payload(sizeof(text_len) + text_len);
-        memcpy(payload.data(), &text_len, sizeof(text_len));
-        memcpy(payload.data() + sizeof(text_len), text.data(), text_len);
-        send_msg(fd, MSG_RESPONSE, payload.data(), payload.size());
-        return text;
-    }};
+static void apply_pipeline_config(const std::vector<uint8_t> &payload, Jarvis &j) {
+    size_t pos = 0;
+    if (pos >= payload.size()) return;
+    uint8_t n_keywords = payload[pos++];
+
+    for (uint8_t k = 0; k < n_keywords && pos < payload.size(); k++) {
+        std::string name = read_cstr(payload, pos);
+
+        uint8_t n_steps = 0;
+        if (pos < payload.size()) n_steps = payload[pos++];
+
+        Pipeline pipe;
+        for (uint8_t s = 0; s < n_steps && pos < payload.size(); s++) {
+            std::string step_name = read_cstr(payload, pos);
+            std::string step_params = read_cstr(payload, pos);
+
+            auto it = OPS.find(step_name);
+            if (it != OPS.end()) {
+                pipe.push_back(it->second(step_params));
+            } else {
+                std::cerr << "  Unknown op: " << step_name << std::endl;
+            }
+        }
+
+        std::cout << "  " << name << ": " << pipe.size() << " step(s)" << std::endl;
+        j.set_pipeline(name, std::move(pipe));
+    }
 }
 
-// Fetch weather, TTS, send text+WAV to client
-static PipeStep weather_response(int fd) {
-    return {"weather_response", [fd](const std::string &) -> std::string {
-        std::string text = get_weather_text();
-        if (text.empty()) return "";
-        auto wav = speak_to_wav(text);
-        if (wav.empty()) return "";
-        uint32_t text_len = text.size();
-        std::vector<uint8_t> payload(sizeof(text_len) + text_len + wav.size());
-        memcpy(payload.data(), &text_len, sizeof(text_len));
-        memcpy(payload.data() + sizeof(text_len), text.data(), text_len);
-        memcpy(payload.data() + sizeof(text_len) + text_len, wav.data(), wav.size());
-        send_msg(fd, MSG_RESPONSE, payload.data(), payload.size());
-        return "";  // terminal step
-    }};
+// ---- Default pipelines for legacy clients ----
+
+static void apply_default_config(Jarvis &j, int client_fd) {
+    // Legacy: no MSG_PIPELINE received. Set up reasonable defaults.
+    // Weather: just run the weather op (result sent via on_result hook)
+    j.set_pipeline("weather", {weather("")});
+    std::cout << "  Using default pipelines (legacy client)" << std::endl;
+    (void)client_fd;
 }
 
 // ---- Server main loop ----
@@ -80,7 +103,7 @@ void jarvis_server(const std::string &model_path,
                    int port)
 {
     std::signal(SIGINT, signal_handler);
-    // No SIGCHLD SIG_IGN here — server pipelines use popen/pclose which need
+    // No SIGCHLD SIG_IGN — server pipelines use popen/pclose which need
     // default SIGCHLD behavior (SIG_IGN causes pclose to return -1/ECHILD).
     g_running = true;
 
@@ -102,10 +125,9 @@ void jarvis_server(const std::string &model_path,
     std::cout << "Listening on port " << port << " (Ctrl+C to stop)" << std::endl;
 
     while (g_running) {
-        // Poll with timeout so we can check g_running periodically
         struct pollfd pfd = { listen_fd, POLLIN, 0 };
         int ret = poll(&pfd, 1, 500);
-        if (ret <= 0) continue;  // timeout or EINTR
+        if (ret <= 0) continue;
 
         struct sockaddr_storage addr;
         socklen_t addr_len = sizeof(addr);
@@ -123,24 +145,36 @@ void jarvis_server(const std::string &model_path,
         audio->init_push(JARVIS_SAMPLE_RATE);
         audio->resume();
 
-        // Per-connection pipelines (server-specific steps, NOT tmux_type)
-        j.set_pipeline("hey_jarvis", {
-            transcribe("flock --shared /tmp/gpu.lock "
-                       "/home/lapo/git/LokalOptima/paraketto/paraketto.fp8"),
-            print_step(),
-            send_text_to_client(client_fd),
-        });
-        j.set_record_follow_up("hey_jarvis", true);
-        j.set_pipeline("weather", {weather_response(client_fd)});
+        // Read first message: MSG_PIPELINE or MSG_AUDIO (legacy)
+        MsgHeader first_hdr;
+        std::vector<uint8_t> first_payload;
+        bool got_first = recv_msg(client_fd, first_hdr, first_payload);
 
+        if (got_first && first_hdr.type == MSG_PIPELINE) {
+            apply_pipeline_config(first_payload, j);
+            std::cout << "  Pipeline configured by client" << std::endl;
+        } else {
+            apply_default_config(j, client_fd);
+            if (got_first && first_hdr.type == MSG_AUDIO) {
+                audio->push((const float *)first_payload.data(),
+                            first_hdr.length / sizeof(float));
+            }
+        }
+
+        // Set hooks for this client connection
         j.on_detect = [client_fd](const std::string &name, float score) {
             send_detection(client_fd, name, score);
+        };
+        j.on_result = [client_fd](Msg &msg) {
+            if (!msg.text.empty() || !msg.audio.empty()) {
+                send_result(client_fd, msg);
+            }
         };
         j.on_ready = [client_fd]() {
             send_status(client_fd, STATUS_READY);
         };
 
-        // TCP receiver thread: read audio from client, push into ring buffer
+        // TCP receiver thread: read audio, push into ring buffer
         std::thread receiver([&j, client_fd, audio]() {
             MsgHeader hdr;
             std::vector<uint8_t> payload;
@@ -149,7 +183,7 @@ void jarvis_server(const std::string &model_path,
             while (g_running) {
                 if (!recv_msg(client_fd, hdr, payload)) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                    j.stop();  // client disconnected → unblock listen()
+                    j.stop();
                     break;
                 }
                 if (hdr.type == MSG_AUDIO) {
@@ -159,9 +193,9 @@ void jarvis_server(const std::string &model_path,
             }
         });
 
-        j.listen(audio);  // blocks until j.stop() or SIGINT
+        j.listen(audio);
 
-        shutdown(client_fd, SHUT_RDWR);  // unblock receiver if still in recv()
+        shutdown(client_fd, SHUT_RDWR);
         if (receiver.joinable()) receiver.join();
         close(client_fd);
         std::cout << "Client disconnected" << std::endl;

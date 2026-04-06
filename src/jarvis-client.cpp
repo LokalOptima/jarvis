@@ -78,16 +78,22 @@ static void receiver_thread(int fd) {
             fprintf(stderr, "\r\033[K");
             printf("  [%s] %s  sim=%.2f\n", time_buf, name, score);
 
-        } else if (hdr.type == MSG_RESPONSE && payload.size() > sizeof(uint32_t)) {
-            // Unpack: uint32 text_len + text + wav_data
-            uint32_t text_len;
-            memcpy(&text_len, payload.data(), sizeof(text_len));
-            if (text_len > 0 && sizeof(uint32_t) + text_len <= payload.size()) {
-                printf("  %.*s\n", (int)text_len, (const char *)(payload.data() + sizeof(uint32_t)));
+        } else if (hdr.type == MSG_RESULT) {
+            // MSG_RESULT: null-terminated keyword + uint32 text_len + text + wav
+            size_t pos = 0;
+            std::string keyword = read_cstr(payload, pos);
+
+            uint32_t text_len = 0;
+            if (pos + sizeof(text_len) <= payload.size()) {
+                memcpy(&text_len, payload.data() + pos, sizeof(text_len));
+                pos += sizeof(text_len);
             }
-            size_t wav_offset = sizeof(uint32_t) + text_len;
-            if (wav_offset < payload.size()) {
-                play_wav(payload.data() + wav_offset, payload.size() - wav_offset);
+            if (text_len > 0 && pos + text_len <= payload.size()) {
+                printf("  %.*s\n", (int)text_len, (const char *)(payload.data() + pos));
+                pos += text_len;
+            }
+            if (pos < payload.size()) {
+                play_wav(payload.data() + pos, payload.size() - pos);
             }
 
         } else if (hdr.type == MSG_STATUS && !payload.empty()) {

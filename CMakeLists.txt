@@ -19,6 +19,7 @@ find_package(SDL2 REQUIRED)
 add_executable(jarvis
     src/main.cpp
     src/jarvis.cpp
+    src/ops.cpp
     src/detect.cpp
     src/server.cpp
     src/client.cpp

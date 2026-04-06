@@ -34,9 +34,10 @@ static constexpr int JARVIS_PORT = 7287;
 
 // Message types
 static constexpr uint8_t MSG_AUDIO    = 0x01;
+static constexpr uint8_t MSG_PIPELINE = 0x02;  // client → server: keyword pipeline specs
 static constexpr uint8_t MSG_DETECT   = 0x81;
 static constexpr uint8_t MSG_STATUS   = 0x82;
-static constexpr uint8_t MSG_RESPONSE = 0x83;  // text (uint32 len + chars) followed by WAV audio
+static constexpr uint8_t MSG_RESULT   = 0x83;  // pipeline result: keyword + text + optional WAV
 
 // Status codes
 static constexpr uint8_t STATUS_BUFFERING = 0;
@@ -89,6 +90,16 @@ static inline bool recv_msg(int fd, MsgHeader &hdr, std::vector<uint8_t> &payloa
     payload.resize(hdr.length);
     if (hdr.length > 0 && !recv_all(fd, payload.data(), hdr.length)) return false;
     return true;
+}
+
+// ---- Payload helpers ----
+
+// Read a null-terminated string from a binary payload, advancing pos past the null.
+static inline std::string read_cstr(const std::vector<uint8_t> &payload, size_t &pos) {
+    std::string s;
+    while (pos < payload.size() && payload[pos] != 0) s += (char)payload[pos++];
+    if (pos < payload.size()) pos++;  // skip null
+    return s;
 }
 
 // ---- Socket helpers ----

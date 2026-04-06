@@ -1,8 +1,8 @@
 /**
- * jarvis.cpp - Wake word detection engine (local mode).
+ * jarvis.cpp - Wake word detection engine.
  *
- * Pipeline:
- *   SDL2 mic capture → ring buffer → detect_once() → pipeline steps
+ * Detection loop: SDL2/push audio -> VAD gate -> detect_once() -> pipeline.
+ * No recording, transcription, or domain logic — those live in ops.cpp.
  */
 
 #include "jarvis.h"
@@ -18,7 +18,6 @@
 #include <iostream>
 #include <memory>
 #include <thread>
-#include <unistd.h>
 
 // ---- Jarvis implementation ----
 
@@ -35,7 +34,6 @@ Jarvis::Jarvis(const std::string &whisper_model,
     }
     std::cout << "    VAD loaded: " << vad_model << std::endl;
 
-    // Suppress verbose whisper model loading output
     whisper_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
 
     struct whisper_context_params cparams = whisper_context_default_params();
@@ -47,6 +45,9 @@ Jarvis::Jarvis(const std::string &whisper_model,
     whisper_set_encoder_only(impl->ctx, true);
     std::cout << "Whisper loaded: " << whisper_model << std::endl;
     std::cout << "------------------------------------" << std::endl;
+
+    // Set engine singletons so ops can access VAD and running flag
+    set_engine_singletons(&impl->vad, &m_running);
 }
 
 Jarvis::~Jarvis() {
@@ -58,27 +59,18 @@ void Jarvis::add_keyword(Keyword kw) {
     lk.name = kw.name;
     lk.template_path = kw.template_path;
     lk.threshold = kw.threshold;
-    lk.refractory_ms = kw.refractory_ms;
     if (!lk.templates.load(lk.template_path)) {
         throw std::runtime_error("Failed to load templates: " + lk.template_path);
     }
     int total = 0;
     for (const auto &t : lk.templates.items) total += t.n_frames;
     std::cout << "  " << lk.name << ": " << total << " frames" << std::endl;
-    for (const auto &step : kw.pipeline) {
-        std::cout << "    -> " << step.desc << std::endl;
-    }
-    std::cout << std::endl;
-    pipelines.push_back(std::move(kw.pipeline));
-    record_follow_ups.push_back(kw.record_follow_up);
+
+    pipelines.emplace_back();  // empty pipeline by default
     impl->keywords.push_back(std::move(lk));
 }
 
-void Jarvis::stop() {
-    m_running = false;
-}
-
-void Jarvis::set_pipeline(const std::string &name, std::vector<PipeStep> pipe) {
+void Jarvis::set_pipeline(const std::string &name, Pipeline pipe) {
     for (size_t i = 0; i < impl->keywords.size(); i++) {
         if (impl->keywords[i].name == name) {
             pipelines[i] = std::move(pipe);
@@ -87,108 +79,32 @@ void Jarvis::set_pipeline(const std::string &name, std::vector<PipeStep> pipe) {
     }
 }
 
-void Jarvis::set_record_follow_up(const std::string &name, bool val) {
-    for (size_t i = 0; i < impl->keywords.size(); i++) {
-        if (impl->keywords[i].name == name) {
-            record_follow_ups[i] = val;
-            return;
-        }
+void Jarvis::on(const std::string &name, const std::string &template_path,
+                Pipeline pipe, float threshold) {
+    add_keyword({name, template_path, threshold});
+    // Pipeline goes to the last added keyword
+    pipelines.back() = std::move(pipe);
+    // Print pipeline steps
+    for (const auto &step : pipelines.back()) {
+        std::cout << "    -> " << step.name;
+        if (!step.params.empty()) std::cout << "(" << step.params << ")";
+        std::cout << std::endl;
     }
+    std::cout << std::endl;
 }
 
-// ---- WAV file writing ----
-
-static bool save_wav(const std::string &path, const float *pcm, int n_samples) {
-    FILE *f = fopen(path.c_str(), "wb");
-    if (!f) return false;
-    int data_bytes = n_samples * 2;
-    int file_bytes = 36 + data_bytes;
-    // RIFF header
-    fwrite("RIFF", 1, 4, f);
-    fwrite(&file_bytes, 4, 1, f);
-    fwrite("WAVE", 1, 4, f);
-    // fmt chunk
-    fwrite("fmt ", 1, 4, f);
-    int fmt_size = 16; fwrite(&fmt_size, 4, 1, f);
-    short audio_fmt = 1; fwrite(&audio_fmt, 2, 1, f);  // PCM
-    short channels = 1;  fwrite(&channels, 2, 1, f);
-    int rate = JARVIS_SAMPLE_RATE; fwrite(&rate, 4, 1, f);
-    int byte_rate = rate * 2; fwrite(&byte_rate, 4, 1, f);
-    short block_align = 2; fwrite(&block_align, 2, 1, f);
-    short bits = 16; fwrite(&bits, 2, 1, f);
-    // data chunk
-    fwrite("data", 1, 4, f);
-    fwrite(&data_bytes, 4, 1, f);
-    std::vector<short> buf(n_samples);
-    for (int i = 0; i < n_samples; i++) {
-        float s = pcm[i];
-        if (s > 1.0f) s = 1.0f; if (s < -1.0f) s = -1.0f;
-        buf[i] = (short)(s * 32767.0f);
-    }
-    fwrite(buf.data(), 2, n_samples, f);
-    fclose(f);
-    return true;
-}
-
-// ---- Post-detection audio recording ----
-
-static std::string record_until_silence(
-    std::shared_ptr<audio_async> audio, SileroVad &vad, int silence_timeout_ms,
-    const std::atomic<bool> &running)
-{
-    const int slide_ms = JARVIS_SLIDE_MS;
-    const int max_record_ms = 30000;  // safety cap: 30 seconds
-    int silence_ms = 0;
-    int total_ms = 0;
-    std::vector<float> recording;
-    std::vector<float> chunk;
-
-    std::cout << "  Recording..." << std::flush;
-
-    while (running && silence_ms < silence_timeout_ms && total_ms < max_record_ms) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(slide_ms));
-
-        audio->get(slide_ms, chunk);
-        if (chunk.empty()) continue;
-
-        recording.insert(recording.end(), chunk.begin(), chunk.end());
-        total_ms += slide_ms;
-
-        bool has_speech = false;
-        for (size_t i = 0; i + SileroVad::CHUNK_SAMPLES <= chunk.size(); i += SileroVad::CHUNK_SAMPLES) {
-            if (vad.process(chunk.data() + i) > 0.5f) has_speech = true;
-        }
-        if (has_speech) silence_ms = 0;
-        else silence_ms += slide_ms;
-
-        render_bar("recording", 1.0f - (float)silence_ms / silence_timeout_ms, 1.0f, 0, true);
-    }
-
-    // Trim trailing silence
-    int trim = (silence_ms * JARVIS_SAMPLE_RATE) / 1000;
-    int keep = (int)recording.size() - trim;
-    if (keep < JARVIS_SAMPLE_RATE / 4) {  // less than 250ms of speech
-        std::cout << " too short, discarded." << std::endl;
-        return "";
-    }
-    recording.resize(keep);
-
-    float dur = (float)recording.size() / JARVIS_SAMPLE_RATE;
-    std::cout << " " << dur << "s" << std::endl;
-
-    std::string path = "/tmp/jarvis_followup.wav";
-    save_wav(path, recording.data(), recording.size());
-    return path;
+void Jarvis::stop() {
+    m_running = false;
 }
 
 // ---- Main detection loop ----
 
 void Jarvis::listen() {
-    // Local mode: create SDL2 audio, install SIGINT handler, delegate to listen(audio)
     static Jarvis *s_instance = nullptr;
     s_instance = this;
     std::signal(SIGINT, [](int) { if (s_instance) s_instance->stop(); });
-    std::signal(SIGCHLD, SIG_IGN);
+    // No SIGCHLD SIG_IGN — ops use popen/pclose which need default behavior.
+    // fire() uses double-fork to avoid zombies.
 
     auto audio = std::make_shared<audio_async>(static_cast<int>(JARVIS_BUFFER_SEC * 1000));
     audio->init(-1, JARVIS_SAMPLE_RATE);
@@ -208,7 +124,7 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
     m_running = true;
     impl->vad.reset();
 
-    // Wait for the audio buffer to fill, showing progress
+    // Wait for audio buffer to fill
     {
         const int steps = 20;
         const int step_ms = (int)(JARVIS_BUFFER_SEC * 1000) / steps;
@@ -227,26 +143,18 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
     std::vector<float> pcm_buffer;
     pcm_buffer.reserve(JARVIS_BUFFER_SAMPLES);
 
-    int refractory = 0;
-    int refractory_total = 0;
     float default_thr = impl->keywords[0].threshold;
 
     while (m_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(JARVIS_SLIDE_MS));
 
-        if (refractory > 0) {
-            float frac = (float)refractory / refractory_total;
-            render_bar("cooldown", frac, 1.0f, 0, true);
-            refractory--;
-            continue;
-        }
-
-        // Get latest 200ms for VAD, then full 2s for detection
+        // VAD gate: check latest 200ms
         audio->get(JARVIS_SLIDE_MS, pcm_buffer);
         if (pcm_buffer.empty()) continue;
 
         bool has_speech = false;
-        for (size_t i = 0; i + SileroVad::CHUNK_SAMPLES <= pcm_buffer.size(); i += SileroVad::CHUNK_SAMPLES) {
+        for (size_t i = 0; i + SileroVad::CHUNK_SAMPLES <= pcm_buffer.size();
+             i += SileroVad::CHUNK_SAMPLES) {
             if (impl->vad.process(pcm_buffer.data() + i) > 0.5f) has_speech = true;
         }
         if (!has_speech) {
@@ -254,6 +162,7 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
             continue;
         }
 
+        // Speech detected: get full 2s buffer and run detection
         audio->get(static_cast<int>(JARVIS_BUFFER_SEC * 1000), pcm_buffer);
         if (pcm_buffer.empty()) continue;
 
@@ -281,114 +190,16 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
             impl->vad.reset();
             audio->clear();
 
-            const auto &pipe = pipelines[det.keyword_index];
-            if (!pipe.empty()) {
-                std::string input;
-                if (record_follow_ups[det.keyword_index]) {
-                    input = record_until_silence(audio, impl->vad, 600, m_running);
-                } else if (audio->has_device()) {
-                    // Pause local mic while pipeline runs (avoid picking up TTS output)
-                    audio->pause();
-                    input = kw.name;
-                } else {
-                    input = kw.name;
-                }
-                if (!input.empty()) run_pipeline(pipe, input);
-                // Resume mic + clear stale audio
-                impl->vad.reset();
-                if (audio->has_device()) audio->resume();
-                audio->clear();
-            }
+            Msg msg;
+            msg.keyword = kw.name;
+            msg.source = audio;
+            run_pipeline(pipelines[det.keyword_index], msg);
+
+            if (on_result) on_result(msg);
+
+            impl->vad.reset();
+            audio->clear();
+
         }
     }
-}
-
-// ---- Pipeline execution ----
-
-void run_pipeline(const std::vector<PipeStep> &steps, const std::string &input) {
-    std::string val = input;
-    for (const auto &step : steps) {
-        if (val.empty()) break;
-        val = step(val);
-    }
-}
-
-// ---- Built-in pipeline steps ----
-
-static std::string shell_escape(const std::string &s) {
-    std::string out;
-    for (char c : s) {
-        if (c == '\'') out += "'\\''";
-        else out += c;
-    }
-    return out;
-}
-
-PipeStep transcribe(const std::string &cmd) {
-    // Extract basename for description
-    std::string name = cmd;
-    auto pos = name.rfind('/');
-    if (pos != std::string::npos) name = name.substr(pos + 1);
-    return {"transcribe(" + name + ")", [cmd](const std::string &wav_path) -> std::string {
-        std::string full = cmd + " " + wav_path + " 2>/dev/null";
-        FILE *pipe = popen(full.c_str(), "r");
-        if (!pipe) return "";
-        std::string last;
-        char buf[4096];
-        while (fgets(buf, sizeof(buf), pipe)) {
-            std::string line(buf);
-            while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-                line.pop_back();
-            if (!line.empty()) last = line;
-        }
-        pclose(pipe);
-        return last;
-    }};
-}
-
-PipeStep print_step() {
-    return {"print", [](const std::string &text) -> std::string {
-        std::cout << "  > " << text << std::endl;
-        return text;
-    }};
-}
-
-PipeStep tmux_type() {
-    return {"?tmux_type", [](const std::string &text) -> std::string {
-        std::string cmd = "tmux send-keys -l -- '" + shell_escape(text) + "' 2>/dev/null";
-        system(cmd.c_str());
-        return text;
-    }};
-}
-
-PipeStep fire(const std::string &cmd) {
-    return {"fire(" + cmd + ")", [cmd](const std::string &) -> std::string {
-        pid_t pid = fork();
-        if (pid == 0) {
-            execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
-            _exit(127);
-        }
-        return "";  // stop pipeline — command runs async
-    }};
-}
-
-PipeStep run(const std::string &cmd) {
-    return {"run(" + cmd + ")", [cmd](const std::string &input) -> std::string {
-        system(cmd.c_str());
-        return input;
-    }};
-}
-
-PipeStep shell_pipe(const std::string &cmd) {
-    return {"pipe(" + cmd + ")", [cmd](const std::string &input) -> std::string {
-        std::string full = "echo '" + shell_escape(input) + "' | " + cmd + " 2>/dev/null";
-        FILE *pipe = popen(full.c_str(), "r");
-        if (!pipe) return "";
-        std::string output;
-        char buf[4096];
-        while (fgets(buf, sizeof(buf), pipe)) output += buf;
-        pclose(pipe);
-        while (!output.empty() && output.back() == '\n') output.pop_back();
-        return output;
-    }};
 }
