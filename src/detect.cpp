@@ -17,6 +17,23 @@ bool Templates::load(const std::string &path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
 
+    // New format: "JWTL" magic + 16-byte model MD5 + model name, then template data.
+    // Legacy format: starts directly with int32 n_templates.
+    char magic[4];
+    f.read(magic, 4);
+    if (memcmp(magic, "JWTL", 4) == 0) {
+        f.read(reinterpret_cast<char *>(model_hash), 16);
+        int32_t name_len;
+        f.read(reinterpret_cast<char *>(&name_len), sizeof(int32_t));
+        if (name_len > 0 && name_len < 256) {
+            model_name.resize(name_len);
+            f.read(model_name.data(), name_len);
+        }
+    } else {
+        memset(model_hash, 0, 16);
+        f.seekg(0);
+    }
+
     int32_t n;
     f.read(reinterpret_cast<char *>(&n), sizeof(int32_t));
     if (n <= 0 || n > 10000) return false;

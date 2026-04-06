@@ -41,6 +41,8 @@ public:
     void on(const std::string &name, const std::string &template_path,
             Pipeline pipe, float threshold = 0.35f);
 
+    void set_ding(const std::string &wav_path);
+
     void listen();                                      // CLI: creates SDL2 mic, installs signals
     void listen(std::shared_ptr<audio_async> audio);    // server/external: blocks until stop()
     void stop();

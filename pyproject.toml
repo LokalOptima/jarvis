@@ -15,6 +15,11 @@ dev = [
     "onnx",
     "onnxruntime",
 ]
+coreml = [
+    "torch==2.7.0",
+    "openai-whisper",
+    "coremltools",
+]
 
 [build-system]
 requires = ["hatchling"]

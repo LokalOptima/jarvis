@@ -2055,10 +2055,24 @@ static bool whisper_encode_internal(
             }
         } else {
 #if defined(WHISPER_USE_COREML)
-            whisper_coreml_encode(wstate.ctx_coreml, mel->ne[0], mel->ne[1], (float *) mel->data, (float *) wstate.embd_enc->data);
+            {
+                // Backend tensors don't expose raw data pointers — copy through temp buffers.
+                const size_t mel_bytes = ggml_nbytes(mel);
+                const size_t enc_bytes = ggml_nbytes(wstate.embd_enc);
+
+                std::vector<float> mel_buf(ggml_nelements(mel));
+                std::vector<float> enc_buf(ggml_nelements(wstate.embd_enc));
+
+                ggml_backend_tensor_get(mel, mel_buf.data(), 0, mel_bytes);
+
+                whisper_coreml_encode(wstate.ctx_coreml, mel->ne[0], mel->ne[1], mel_buf.data(), enc_buf.data());
+
+                ggml_backend_tensor_set(wstate.embd_enc, enc_buf.data(), 0, enc_bytes);
+            }
 #elif defined(WHISPER_USE_OPENVINO)
             whisper_openvino_encode(wstate.ctx_openvino, mel, wstate.embd_enc);
 #endif
+            ggml_backend_sched_reset(sched);
         }
     }
     // encoder
@@ -2872,3 +2886,4 @@ void whisper_set_encoder_only(struct whisper_context * ctx, bool encoder_only) {
         ctx->state->skip_cross = encoder_only;
     }
 }
+
