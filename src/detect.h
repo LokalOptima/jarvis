@@ -53,7 +53,6 @@ struct LoadedKeyword {
     std::string name;
     std::string template_path;
     float threshold = 0.35f;
-    int refractory_ms = 2000;
     Templates templates;
 };
 
@@ -88,7 +87,14 @@ DetectResult detect_once(
     const float *pcm, int n_samples,
     DetectScratch &scratch);
 
-// Terminal bar visualization (pinned to bar_row when set).
+// Terminal display.
 void render_bar(const char *name, float score, float threshold, int ms, bool silent);
-void setup_scroll_region();   // pin bar at current cursor row, scroll logs below
-void teardown_scroll_region();
+void render_status(const char *keyword, float score, const char *time_str);
+void render_separator();
+void render_clear();  // clean up on exit
+
+// Model/template path helpers.
+std::string cache_dir();  // $HOME/.cache/jarvis
+std::string model_tag(const std::string &model_path);
+std::string template_path(const std::string &keyword, const std::string &tag);
+std::string diagnose_path(const std::string &path);

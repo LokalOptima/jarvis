@@ -1,18 +1,18 @@
 /**
  * jarvis.h - Wake word detection engine.
  *
- * Detection only. Pipelines are defined via ops.h and registered per-keyword.
+ * Detection only. Register keywords with callbacks:
  *
  *     Jarvis j("models/ggml-tiny.bin", "models/silero_vad.bin");
- *     j.on("hey_jarvis", "models/templates/hey_jarvis.bin", {
- *         transcribe(PARAKETTO), print(""), tmux(""),
- *     });
+ *     j.add_keyword({"hey_jarvis", "models/templates/hey_jarvis.bin"});
+ *     j.on_detect = [](const std::string &kw, float score,
+ *                      std::shared_ptr<audio_async> audio) {
+ *         std::cout << kw << " " << score << std::endl;
+ *     };
  *     j.listen();
  */
 
 #pragma once
-
-#include "ops.h"
 
 #include <atomic>
 #include <functional>
@@ -35,29 +35,24 @@ public:
     ~Jarvis();
 
     void add_keyword(Keyword kw);
-    void set_pipeline(const std::string &name, Pipeline pipe);
-
-    // Convenience: add_keyword + set_pipeline in one call
-    void on(const std::string &name, const std::string &template_path,
-            Pipeline pipe, float threshold = 0.35f);
-
     void set_ding(const std::string &wav_path);
 
     void listen();                                      // CLI: creates SDL2 mic, installs signals
     void listen(std::shared_ptr<audio_async> audio);    // server/external: blocks until stop()
     void stop();
 
-    // Hooks (set by mode before calling listen)
-    std::function<void(const std::string &name, float score)> on_detect;
-    std::function<void(Msg &msg)>                             on_result;
-    std::function<void()>                                     on_ready;
+    // Callback on keyword detection.
+    // Receives keyword name, similarity score, and audio source (for recording).
+    std::function<void(const std::string &name, float score,
+                       std::shared_ptr<audio_async> audio)> on_detect;
+    std::function<void()> on_ready;
 
     Jarvis(const Jarvis &) = delete;
     Jarvis &operator=(const Jarvis &) = delete;
 
 private:
+    void print_header();
     struct Impl;
     std::unique_ptr<Impl> impl;
-    std::vector<Pipeline> pipelines;
     std::atomic<bool> m_running{false};
 };

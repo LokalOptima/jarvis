@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // ---- Templates ----
@@ -197,28 +198,35 @@ DetectResult detect_once(
     return result;
 }
 
-// ---- Terminal bar ----
+// ---- Terminal display ----
+//
+// Layout (after header):
+//   line 1:  bar       (render_bar updates this)
+//   line 2:  status    (render_status updates this)
+//   line 3:  separator (render_separator redraws this)
+//
+// Cursor always rests after line 3. To update, move up and overwrite.
 
-static int g_bar_row = 0;  // 0 = not pinned (legacy \r mode)
+static constexpr int DISPLAY_LINES = 3;  // bar + status + separator
 
-void setup_scroll_region() {
-    struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) < 0) return;
-    g_bar_row = ws.ws_row;
-    // APT-style: newline, save cursor (DECSC), set scroll region, restore (DECRC), up 1
-    fprintf(stdout, "\n\0337\033[1;%dr\0338\033[1A", ws.ws_row - 1);
-    fflush(stdout);
+void render_separator() {
+    fprintf(stderr, "\033[2m────────────────────────────────────────────────────\033[0m\033[K\n");
+    fflush(stderr);
 }
 
-void teardown_scroll_region() {
-    if (g_bar_row <= 0) return;
-    struct winsize ws;
-    ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
-    // Restore full scroll region, jump to bar row, clear it, restore cursor
-    fprintf(stdout, "\0337\033[1;%dr\033[%d;1H\033[2K\0338",
-            ws.ws_row, ws.ws_row);
-    fflush(stdout);
-    g_bar_row = 0;
+void render_clear() {
+    fprintf(stderr, "\033[%dA\r", DISPLAY_LINES);
+    for (int i = 0; i < DISPLAY_LINES; i++)
+        fprintf(stderr, "\033[2K\n");
+    fprintf(stderr, "\033[%dA\r", DISPLAY_LINES);
+    fflush(stderr);
+}
+
+void render_status(const char *keyword, float score, const char *time_str) {
+    // Move up to status line (1 above separator), overwrite, redraw separator
+    fprintf(stderr, "\033[%dA\r", DISPLAY_LINES - 1);
+    fprintf(stderr, "  \033[2m[%s]\033[0m %s  %.2f\033[K\n", time_str, keyword, score);
+    render_separator();
 }
 
 void render_bar(const char *name, float score, float threshold, int ms, bool silent) {
@@ -229,12 +237,8 @@ void render_bar(const char *name, float score, float threshold, int ms, bool sil
     constexpr int W = 36;
     int thr = std::max(0, std::min(W - 1, (int)(threshold * W)));
 
-    if (g_bar_row > 0) {
-        // DECSC + jump to pinned row
-        p += std::snprintf(p, 32, "\0337\033[%d;1H", g_bar_row);
-    } else {
-        *p++ = '\r';
-    }
+    // Move cursor to bar line
+    p += std::snprintf(p, 32, "\033[%dA\r", DISPLAY_LINES);
     *p++ = ' '; *p++ = ' ';
 
     int nlen = (int)strlen(name);
@@ -278,12 +282,44 @@ void render_bar(const char *name, float score, float threshold, int ms, bool sil
         p += std::snprintf(p, 64, "\033[0m  %4.2f  %3dms\033[K", score, ms);
     }
 
-    if (g_bar_row > 0) {
-        // DECRC: restore cursor to scroll region
-        *p++ = '\033'; *p++ = '8';
-    }
+    // Move to next line (status line) but don't overwrite it, skip to after separator
+    p += std::snprintf(p, 16, "\n\033[%dB", DISPLAY_LINES - 1);
 
-    FILE *out = g_bar_row > 0 ? stdout : stderr;
-    fwrite(buf, 1, p - buf, out);
-    fflush(out);
+    fwrite(buf, 1, p - buf, stderr);
+    fflush(stderr);
+}
+
+// ---- Path helpers ----
+
+std::string cache_dir() {
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    return std::string(home) + "/.cache/jarvis";
+}
+
+std::string model_tag(const std::string &model_path) {
+    std::string stem = model_path;
+    auto slash = stem.rfind('/');
+    if (slash != std::string::npos) stem = stem.substr(slash + 1);
+    auto dot = stem.rfind('.');
+    if (dot != std::string::npos) stem = stem.substr(0, dot);
+    if (stem.rfind("ggml-", 0) == 0) stem = stem.substr(5);
+    return stem;
+}
+
+std::string template_path(const std::string &keyword, const std::string &tag) {
+    return cache_dir() + "/templates/" + keyword + "." + tag + ".bin";
+}
+
+std::string diagnose_path(const std::string &path) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0)
+        return path + ": file not found";
+    if (S_ISLNK(st.st_mode)) {
+        if (stat(path.c_str(), &st) != 0)
+            return path + ": broken symlink";
+    }
+    if (st.st_size == 0)
+        return path + ": file is empty";
+    return path + ": file exists but failed to parse";
 }

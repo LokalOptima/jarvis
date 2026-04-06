@@ -1,12 +1,12 @@
 /**
  * jarvis.cpp - Wake word detection engine.
  *
- * Detection loop: SDL2/push audio -> VAD gate -> detect_once() -> pipeline.
- * No recording, transcription, or domain logic — those live in ops.cpp.
+ * Detection loop: SDL2/push audio -> VAD gate -> detect_once() -> callback.
  */
 
 #include "jarvis.h"
 #include "detect.h"
+#include "playback.h"
 #include "vad_ggml.h"
 #include <audio_async.hpp>
 
@@ -19,20 +19,6 @@
 #include <iostream>
 #include <memory>
 #include <thread>
-#include <sys/stat.h>
-
-static std::string diagnose_path(const std::string &path) {
-    struct stat st;
-    if (lstat(path.c_str(), &st) != 0)
-        return path + ": file not found";
-    if (S_ISLNK(st.st_mode)) {
-        if (stat(path.c_str(), &st) != 0)
-            return path + ": broken symlink";
-    }
-    if (st.st_size == 0)
-        return path + ": file is empty";
-    return path + ": file exists but failed to parse";
-}
 
 // ---- Jarvis implementation ----
 
@@ -48,7 +34,6 @@ Jarvis::Jarvis(const std::string &whisper_model,
     if (!impl->vad.load(vad_model)) {
         throw std::runtime_error("Failed to load VAD model: " + diagnose_path(vad_model));
     }
-    std::cout << "    VAD loaded: " << vad_model << std::endl;
 
     whisper_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
 
@@ -59,12 +44,6 @@ Jarvis::Jarvis(const std::string &whisper_model,
         throw std::runtime_error("Failed to load whisper model: " + diagnose_path(whisper_model));
     }
     whisper_set_encoder_only(impl->ctx, true);
-
-    std::cout << "Whisper loaded: " << whisper_model << std::endl;
-    std::cout << "       Engine: " << JARVIS_ENGINE << std::endl;
-
-    // Set engine singletons so ops can access VAD and running flag
-    set_engine_singletons(&impl->vad, &m_running);
 }
 
 Jarvis::~Jarvis() {
@@ -79,41 +58,7 @@ void Jarvis::add_keyword(Keyword kw) {
     if (!lk.templates.load(lk.template_path)) {
         throw std::runtime_error("Failed to load templates: " + diagnose_path(lk.template_path));
     }
-    int total = 0;
-    for (const auto &t : lk.templates.items) total += t.n_frames;
-    std::cout << "  " << lk.name << ": " << total << " frames";
-    if (!lk.templates.model_name.empty()) {
-        char hex[33] = {};
-        for (int i = 0; i < 16; i++) snprintf(hex + i*2, 3, "%02x", lk.templates.model_hash[i]);
-        std::cout << " (model: " << lk.templates.model_name << ", md5: " << hex << ")";
-    }
-    std::cout << std::endl;
-
-    pipelines.emplace_back();  // empty pipeline by default
     impl->keywords.push_back(std::move(lk));
-}
-
-void Jarvis::set_pipeline(const std::string &name, Pipeline pipe) {
-    for (size_t i = 0; i < impl->keywords.size(); i++) {
-        if (impl->keywords[i].name == name) {
-            pipelines[i] = std::move(pipe);
-            return;
-        }
-    }
-}
-
-void Jarvis::on(const std::string &name, const std::string &template_path,
-                Pipeline pipe, float threshold) {
-    add_keyword({name, template_path, threshold});
-    // Pipeline goes to the last added keyword
-    pipelines.back() = std::move(pipe);
-    // Print pipeline steps
-    for (const auto &step : pipelines.back()) {
-        std::cout << "    -> " << step.name;
-        if (!step.params.empty()) std::cout << "(" << step.params << ")";
-        std::cout << std::endl;
-    }
-    std::cout << std::endl;
 }
 
 void Jarvis::set_ding(const std::string &wav_path) {
@@ -126,11 +71,28 @@ void Jarvis::set_ding(const std::string &wav_path) {
     f.seekg(0);
     impl->ding_wav.resize(sz);
     f.read(reinterpret_cast<char *>(impl->ding_wav.data()), sz);
-    std::cout << "   Ding loaded: " << wav_path << std::endl;
 }
 
 void Jarvis::stop() {
     m_running = false;
+}
+
+// ---- Header ----
+
+void Jarvis::print_header() {
+    // Collect keyword names
+    std::string kw_list;
+    for (size_t i = 0; i < impl->keywords.size(); i++) {
+        if (i > 0) kw_list += ", ";
+        kw_list += impl->keywords[i].name;
+    }
+
+    fprintf(stderr,
+        "\033[2m───\033[0m jarvis \033[2m"
+        "─────────────────────────────────────────\033[0m\n");
+    fprintf(stderr, "    engine: %s\n", JARVIS_ENGINE);
+    fprintf(stderr, "  keywords: %s\n\n", kw_list.c_str());
+    fflush(stderr);
 }
 
 // ---- Main detection loop ----
@@ -139,9 +101,6 @@ void Jarvis::listen() {
     static Jarvis *s_instance = nullptr;
     s_instance = this;
     std::signal(SIGINT, [](int) { if (s_instance) s_instance->stop(); });
-    std::signal(SIGWINCH, [](int) { setup_scroll_region(); });
-    // No SIGCHLD SIG_IGN — ops use popen/pclose which need default behavior.
-    // fire() uses double-fork to avoid zombies.
 
     auto audio = std::make_shared<audio_async>(static_cast<int>(JARVIS_BUFFER_SEC * 1000));
     audio->init(-1, JARVIS_SAMPLE_RATE);
@@ -149,8 +108,8 @@ void Jarvis::listen() {
 
     listen(audio);
 
-    teardown_scroll_region();
-    std::cout << "Stopped." << std::endl;
+    render_clear();
+    fprintf(stderr, "Stopped.\n");
 }
 
 void Jarvis::listen(std::shared_ptr<audio_async> audio) {
@@ -162,9 +121,14 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
     m_running = true;
     impl->vad.reset();
 
+    print_header();
+
+    // Print initial display: bar + status + separator
+    fprintf(stderr, "  listening\033[K\n");
+    fprintf(stderr, "  \033[2m—\033[0m\033[K\n");
+    render_separator();
+
     if (on_ready) on_ready();
-    std::cout << std::endl;  // blank line before bar
-    setup_scroll_region();
 
     DetectScratch scratch;
     scratch.init();
@@ -183,7 +147,7 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
         bool has_speech = false;
         for (size_t i = 0; i + SileroVad::CHUNK_SAMPLES <= pcm_buffer.size();
              i += SileroVad::CHUNK_SAMPLES) {
-            if (impl->vad.process(pcm_buffer.data() + i) > 0.5f) has_speech = true;
+            if (impl->vad.process(pcm_buffer.data() + i) > 0.5f) { has_speech = true; break; }
         }
         if (!has_speech) {
             render_bar("listening", 0.0f, default_thr, 0, true);
@@ -209,27 +173,16 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
             auto tt = std::chrono::system_clock::to_time_t(now);
             char time_buf[32];
             std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&tt));
-            std::cout << "  [" << time_buf << "] " << kw.name
-                      << "  sim=" << det.score << std::endl;
+
+            render_status(kw.name.c_str(), det.score, time_buf);
 
             if (!impl->ding_wav.empty())
                 play_wav(impl->ding_wav.data(), impl->ding_wav.size(), false);
 
-            if (on_detect) on_detect(kw.name, det.score);
+            if (on_detect) on_detect(kw.name, det.score, audio);
 
             impl->vad.reset();
             audio->clear();
-
-            Msg msg;
-            msg.keyword = kw.name;
-            msg.source = audio;
-            run_pipeline(pipelines[det.keyword_index], msg);
-
-            if (on_result) on_result(msg);
-
-            impl->vad.reset();
-            audio->clear();
-
         }
     }
 }
