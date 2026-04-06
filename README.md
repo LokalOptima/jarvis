@@ -25,14 +25,15 @@ Local mode (C++, runs always):
                     →  skip onset frames  →  CMVN
                     →  subsequence DTW vs all keyword templates
                     →  score > threshold?  →  DETECTED
-                    →  optional: record follow-up until silence
-                    →  pipeline: transcribe → print → tmux_type
+                    →  run pipeline: transcribe → print → tmux
 
 Server/client mode:
 
-  Client: SDL2 mic  →  200ms audio chunks  →  TCP  →  Server
+  Client: split pipeline at REMOTE/LOCAL boundary
+          send REMOTE specs via MSG_PIPELINE  →  stream audio  →  TCP
   Server: ring buffer  →  same detection loop  →  MSG_DETECT back
-                       →  pipeline execution  →  MSG_RESPONSE (text + audio)
+                       →  resolve + run REMOTE pipeline  →  MSG_RESULT
+  Client: play audio  →  run LOCAL pipeline steps
 ```
 
 ## Key Techniques
@@ -51,20 +52,20 @@ Server/client mode:
 
 **Variable-length encoding** — Whisper.cpp was designed for 30-second chunks (1500 frames). We set `whisper_set_audio_ctx()` to the actual frame count (~100 for 2 seconds), encoding only what's needed. ~15x less work per cycle.
 
-**Composable pipelines** — Each keyword carries a chain of `PipeStep` functions (string in, string out). Built-in steps: `transcribe()` (run STT on recorded audio), `print_step()`, `tmux_type()` (type into active tmux pane), `run()`, `fire()` (fork async), `shell_pipe()`. Empty return stops the chain.
+**Composable pipelines** — Each keyword has a pipeline of ops that mutate a `Msg` in place. Steps declare `REMOTE`/`LOCAL` placement for client/server splitting. Built-in ops: `transcribe` (eager record + STT), `weather`, `tts` (synthesize + play), `print`, `tmux` (type into active pane), `save`, `fire` (fork async), `run`. New ops: one factory function + one dict entry.
 
 ## Project Structure
 
 ```
 src/
-  main.cpp              CLI entry — mode dispatch (local/server/client), keyword config
-  jarvis.cpp/h          Detection engine — listen loop, pipelines, follow-up recording
+  main.cpp              CLI entry — mode dispatch (local/server/client), keyword + pipeline config
+  jarvis.cpp/h          Detection engine — listen loop, VAD gate, on() convenience
+  ops.cpp/h             Msg, Step, Pipeline, Placement, OPS dict, all built-in ops
   detect.cpp/h          Core detection — mel, encode, CMVN, subsequence DTW, scoring
-  vad.cpp/h             Silero VAD — pure C implementation (~300K params)
-  vad_ggml.cpp/h        Silero VAD — ggml graph-based variant
-  server.cpp/h          TCP server — per-connection detection, response streaming
-  client.cpp/h          TCP client — audio streaming, detection display, audio playback
-  net.h                 TCP framing protocol, dual-stack sockets
+  vad_ggml.cpp/h        Silero VAD — ggml graph-based variant (~300K params)
+  server.cpp/h          TCP server — resolve client pipeline specs via OPS dict
+  client.cpp/h          TCP client — pipeline split, audio streaming, local step dispatch
+  net.h                 TCP framing protocol, payload helpers, dual-stack sockets
   audio_async.cpp/hpp   Ring buffer — SDL2 capture mode + push mode (for server)
   whisper.cpp/h         Vendored whisper.cpp (encoder-only, custom embedding extraction)
   encode.cpp            CLI: extract encoder embeddings from WAV files (used by enroll)
@@ -101,7 +102,7 @@ data/                   (gitignored)
   negative.wav          Test recording without wake word (for ablation)
   background.wav        Test recording of room noise (for ablation)
 
-blog/                   Technical writeups of the development process (8 posts)
+blog/                   Technical writeups of the development process (9 posts)
 ```
 
 ## Prerequisites
@@ -174,7 +175,6 @@ The client streams 200ms audio chunks over TCP. The server runs the full detecti
 ./build/jarvis [options]
   --model PATH       Whisper model      (default: models/ggml-tiny.bin)
   --vad PATH         VAD model          (default: models/silero_vad.bin)
-  --detect-only      Log detections without running pipelines
   --server           Server mode: listen for audio over TCP
   --client HOST      Client mode: stream mic to HOST
   --port PORT        TCP port           (default: 7287)
@@ -185,7 +185,6 @@ The client streams 200ms audio chunks over TCP. The server runs the full detecti
 
 ```
 make run              Local detection (compiles if needed)
-make run-detect       Detection-only mode (no pipelines)
 make server           Start TCP server
 make client           Build lightweight client binary
 make enroll           Open enrollment web UI
@@ -217,3 +216,13 @@ On a modern x86 CPU, the hot loop takes ~10-15ms per 200ms cycle:
 - CMVN + DTW: <1ms
 
 The detector uses ~150MB RAM (Whisper Tiny model + Silero VAD + SDL2 audio buffer). Run `./build/bench models/ggml-tiny.bin` to measure on your hardware.
+
+## Acknowledgments
+
+This project builds on the work of:
+
+- **[Whisper](https://github.com/openai/whisper)** by OpenAI — the Whisper Tiny model used as a frozen feature extractor (MIT License)
+- **[whisper.cpp](https://github.com/ggerganov/whisper.cpp)** by Georgi Gerganov — vendored encoder-only fork with custom modifications (MIT License, Copyright 2023-2026 The ggml authors)
+- **[ggml](https://github.com/ggml-org/ggml)** — vendored CPU tensor library (MIT License, Copyright 2023-2026 The ggml authors)
+- **[Silero VAD](https://github.com/snakers4/silero-vad)** by the Silero Team — voice activity detection model ported to C++ (MIT License, Copyright 2020-present Silero Team)
+- **[nlohmann/json](https://github.com/nlohmann/json)** by Niels Lohmann — JSON parsing (MIT License)
