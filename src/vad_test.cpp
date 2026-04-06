@@ -21,14 +21,14 @@ static bool read_wav_16k(const char *path, std::vector<float> &audio) {
 
     // Read RIFF header
     char riff[4];
-    fread(riff, 1, 4, f);
+    if (fread(riff, 1, 4, f) != 4) { fclose(f); return false; }
     if (memcmp(riff, "RIFF", 4) != 0) { fclose(f); return false; }
 
     uint32_t file_size;
-    fread(&file_size, 4, 1, f);
+    if (fread(&file_size, 4, 1, f) != 1) { fclose(f); return false; }
 
     char wave[4];
-    fread(wave, 1, 4, f);
+    if (fread(wave, 1, 4, f) != 4) { fclose(f); return false; }
     if (memcmp(wave, "WAVE", 4) != 0) { fclose(f); return false; }
 
     // Find data chunk
@@ -43,11 +43,11 @@ static bool read_wav_16k(const char *path, std::vector<float> &audio) {
 
         if (memcmp(chunk_id, "fmt ", 4) == 0) {
             uint16_t format;
-            fread(&format, 2, 1, f);
-            fread(&channels, 2, 1, f);
-            fread(&sample_rate, 4, 1, f);
+            if (fread(&format, 2, 1, f) != 1) { fclose(f); return false; }
+            if (fread(&channels, 2, 1, f) != 1) { fclose(f); return false; }
+            if (fread(&sample_rate, 4, 1, f) != 1) { fclose(f); return false; }
             fseek(f, 6, SEEK_CUR);  // skip byte_rate + block_align
-            fread(&bits_per_sample, 2, 1, f);
+            if (fread(&bits_per_sample, 2, 1, f) != 1) { fclose(f); return false; }
             if (chunk_size > 16) fseek(f, chunk_size - 16, SEEK_CUR);
         } else if (memcmp(chunk_id, "data", 4) == 0) {
             if (sample_rate != 16000 || channels != 1 || bits_per_sample != 16) {
@@ -58,7 +58,7 @@ static bool read_wav_16k(const char *path, std::vector<float> &audio) {
             }
             int n_samples = chunk_size / 2;
             std::vector<int16_t> raw(n_samples);
-            fread(raw.data(), 2, n_samples, f);
+            if (fread(raw.data(), 2, n_samples, f) != (size_t)n_samples) { fclose(f); return false; }
             audio.resize(n_samples);
             for (int i = 0; i < n_samples; i++)
                 audio[i] = raw[i] / 32768.0f;

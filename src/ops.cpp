@@ -48,7 +48,7 @@ void play_wav(const uint8_t *data, size_t size, bool wait) {
     char tmp[] = "/tmp/jarvis-XXXXXX.wav";
     int fd = mkstemps(tmp, 4);
     if (fd < 0) return;
-    write(fd, data, size);
+    if (write(fd, data, size) < 0) { ::close(fd); return; }
     ::close(fd);
     pid_t pid = fork();
     if (pid == 0) {
@@ -237,7 +237,7 @@ Step tmux(const std::string &params) {
     return {"tmux", params, LOCAL, [](Msg &msg) {
         if (msg.text.empty()) return;
         std::string cmd = "tmux send-keys -l -- '" + shell_escape(msg.text) + "' 2>/dev/null";
-        system(cmd.c_str());
+        int ret = system(cmd.c_str()); (void)ret;
     }};
 }
 
@@ -273,7 +273,7 @@ Step fire(const std::string &params) {
 
 Step run(const std::string &params) {
     return {"run", params, LOCAL, [params](Msg &) {
-        system(params.c_str());
+        int ret = system(params.c_str()); (void)ret;
     }};
 }
 

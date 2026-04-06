@@ -124,17 +124,6 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
     m_running = true;
     impl->vad.reset();
 
-    // Wait for audio buffer to fill
-    {
-        const int steps = 20;
-        const int step_ms = (int)(JARVIS_BUFFER_SEC * 1000) / steps;
-        for (int i = 1; i <= steps && m_running; i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
-            render_bar("buffering", (float)i / steps, 1.0f, 0, true);
-        }
-        std::cerr << "\r\033[K" << std::flush;
-    }
-
     if (on_ready) on_ready();
     std::cout << "Listening... (" << impl->keywords.size() << " keyword(s), Ctrl+C to stop)" << std::endl;
 

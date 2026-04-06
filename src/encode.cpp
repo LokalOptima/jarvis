@@ -46,11 +46,11 @@ static bool read_wav_pcm(const char *path, std::vector<float> &pcm) {
         if (fread(chunk_id, 1, 4, f) != 4) { fclose(f); return false; }
         if (fread(&chunk_size, 4, 1, f) != 1) { fclose(f); return false; }
         if (memcmp(chunk_id, "fmt ", 4) == 0) {
-            fread(&audio_format, 2, 1, f);
-            fread(&channels, 2, 1, f);
-            fread(&sample_rate, 4, 1, f);
+            if (fread(&audio_format, 2, 1, f) != 1) { fclose(f); return false; }
+            if (fread(&channels, 2, 1, f) != 1) { fclose(f); return false; }
+            if (fread(&sample_rate, 4, 1, f) != 1) { fclose(f); return false; }
             fseek(f, 6, SEEK_CUR); // skip byte_rate + block_align
-            fread(&bits_per_sample, 2, 1, f);
+            if (fread(&bits_per_sample, 2, 1, f) != 1) { fclose(f); return false; }
             if (chunk_size > 16) fseek(f, chunk_size - 16, SEEK_CUR);
             break;
         }

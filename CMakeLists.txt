@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 foreach(_backend BLAS METAL CUDA VULKAN OPENCL SYCL MUSA HIP CANN)
     set(GGML_${_backend} OFF CACHE BOOL "" FORCE)
 endforeach()
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(lib/ggml)
 
 find_package(SDL2 REQUIRED)

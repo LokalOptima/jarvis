@@ -38,7 +38,7 @@ static void play_wav(const uint8_t *data, size_t size) {
     char tmp[] = "/tmp/jarvis-XXXXXX.wav";
     int fd = mkstemps(tmp, 4);
     if (fd < 0) return;
-    write(fd, data, size);
+    if (write(fd, data, size) < 0) { close(fd); return; }
     close(fd);
 
     fprintf(stderr, "  Playing response (%zu bytes)\n", size);
