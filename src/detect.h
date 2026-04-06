@@ -35,6 +35,8 @@ struct Template {
 
 struct Templates {
     std::vector<Template> items;
+    uint8_t model_hash[16] = {};
+    std::string model_name;
 
     bool load(const std::string &path);
 

@@ -19,6 +19,20 @@
 #include <iostream>
 #include <memory>
 #include <thread>
+#include <sys/stat.h>
+
+static std::string diagnose_path(const std::string &path) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0)
+        return path + ": file not found";
+    if (S_ISLNK(st.st_mode)) {
+        if (stat(path.c_str(), &st) != 0)
+            return path + ": broken symlink";
+    }
+    if (st.st_size == 0)
+        return path + ": file is empty";
+    return path + ": file exists but failed to parse";
+}
 
 // ---- Jarvis implementation ----
 
@@ -32,7 +46,7 @@ struct Jarvis::Impl {
 Jarvis::Jarvis(const std::string &whisper_model,
                const std::string &vad_model) : impl(std::make_unique<Impl>()) {
     if (!impl->vad.load(vad_model)) {
-        throw std::runtime_error("Failed to load VAD model: " + vad_model);
+        throw std::runtime_error("Failed to load VAD model: " + diagnose_path(vad_model));
     }
     std::cout << "    VAD loaded: " << vad_model << std::endl;
 
@@ -42,10 +56,12 @@ Jarvis::Jarvis(const std::string &whisper_model,
     cparams.use_gpu = false;
     impl->ctx = whisper_init_from_file_with_params(whisper_model.c_str(), cparams);
     if (!impl->ctx) {
-        throw std::runtime_error("Failed to load whisper model: " + whisper_model);
+        throw std::runtime_error("Failed to load whisper model: " + diagnose_path(whisper_model));
     }
     whisper_set_encoder_only(impl->ctx, true);
+
     std::cout << "Whisper loaded: " << whisper_model << std::endl;
+    std::cout << "       Engine: " << JARVIS_ENGINE << std::endl;
 
     // Set engine singletons so ops can access VAD and running flag
     set_engine_singletons(&impl->vad, &m_running);
@@ -61,11 +77,17 @@ void Jarvis::add_keyword(Keyword kw) {
     lk.template_path = kw.template_path;
     lk.threshold = kw.threshold;
     if (!lk.templates.load(lk.template_path)) {
-        throw std::runtime_error("Failed to load templates: " + lk.template_path);
+        throw std::runtime_error("Failed to load templates: " + diagnose_path(lk.template_path));
     }
     int total = 0;
     for (const auto &t : lk.templates.items) total += t.n_frames;
-    std::cout << "  " << lk.name << ": " << total << " frames" << std::endl;
+    std::cout << "  " << lk.name << ": " << total << " frames";
+    if (!lk.templates.model_name.empty()) {
+        char hex[33] = {};
+        for (int i = 0; i < 16; i++) snprintf(hex + i*2, 3, "%02x", lk.templates.model_hash[i]);
+        std::cout << " (model: " << lk.templates.model_name << ", md5: " << hex << ")";
+    }
+    std::cout << std::endl;
 
     pipelines.emplace_back();  // empty pipeline by default
     impl->keywords.push_back(std::move(lk));

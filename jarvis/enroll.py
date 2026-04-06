@@ -27,7 +27,7 @@ from jarvis import (
     keyword_name, list_keyword_dirs,
 )
 from jarvis.dtw import cmvn, dba
-from jarvis.features import extract_features_batch
+from jarvis.features import extract_features_batch, model_tag, DEFAULT_MODEL
 
 PORT = 8457
 
@@ -43,7 +43,7 @@ def next_clip_index(keyword_dir: Path) -> int:
     return int(last.split("_")[1]) + 1
 
 
-def _build_keyword(keyword_dir: Path) -> bool:
+def _build_keyword(keyword_dir: Path, model: Path = DEFAULT_MODEL) -> bool:
     """Build a single keyword's template from its clips. Returns True on success."""
     keyword = keyword_dir.name
     wav_files = sorted(keyword_dir.glob("*.wav"))
@@ -53,7 +53,7 @@ def _build_keyword(keyword_dir: Path) -> bool:
     print(f"\n--- {keyword} ({len(wav_files)} clips) ---")
     print(f"Extracting features...")
 
-    all_features = extract_features_batch(wav_files)
+    all_features = extract_features_batch(wav_files, model=model)
     raw_features = []
     for i, (wav_path, features) in enumerate(zip(wav_files, all_features)):
         features = features[ONSET_SKIP:MAX_TEMPLATE_FRAMES]
@@ -72,19 +72,34 @@ def _build_keyword(keyword_dir: Path) -> bool:
 
     TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Binary format: int32 n_templates, per template: int32 n_frames, float[n_frames * 384]
-    bin_path = TEMPLATES_DIR / f"{keyword}.bin"
+    # Binary format:
+    #   char[4]  magic "JWTL"
+    #   char[16] model MD5 (raw bytes, from the model file used for feature extraction)
+    #   int32    model_name_len
+    #   char[]   model_name (e.g. "ggml-tiny-FP16.bin")
+    #   int32    n_templates
+    #   per template: int32 n_frames, float[n_frames * 384]
+    import hashlib
+    model_hash = hashlib.md5(model.read_bytes()).digest()
+    model_name = model.name.encode("utf-8")
+
+    bin_path = TEMPLATES_DIR / f"{keyword}.{model_tag(model)}.bin"
     with open(bin_path, "wb") as f:
+        f.write(b"JWTL")
+        f.write(model_hash)
+        f.write(struct.pack("i", len(model_name)))
+        f.write(model_name)
         f.write(struct.pack("i", 1))  # 1 DBA template
         f.write(struct.pack("i", template.shape[0]))
         f.write(template.astype(np.float32).tobytes())
 
     print(f"  1 DBA template, {template.shape[0]} frames (384-dim, CMVN + L2-normalized)")
+    print(f"  model: {model.name} (md5: {model_hash.hex()})")
     print(f"  {bin_path} ({bin_path.stat().st_size} bytes)")
     return True
 
 
-def build_templates():
+def build_templates(model: Path = DEFAULT_MODEL):
     """Read clips for all keywords, extract features, build templates."""
     keyword_dirs = list_keyword_dirs()
 
@@ -93,11 +108,13 @@ def build_templates():
         print("Run 'uv run enroll' to record clips first.")
         sys.exit(1)
 
+    tag = model_tag(model)
+    print(f"Model: {model.name} (tag: {tag})")
     print(f"Found {len(keyword_dirs)} keyword(s): {', '.join(d.name for d in keyword_dirs)}")
 
     built = 0
     for keyword_dir in keyword_dirs:
-        if _build_keyword(keyword_dir):
+        if _build_keyword(keyword_dir, model=model):
             built += 1
 
     if built == 0:
@@ -977,6 +994,17 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Jarvis enrollment")
+    parser.add_argument("--build", action="store_true", help="Build templates from clips")
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL,
+                        help=f"Model for feature extraction (default: {DEFAULT_MODEL})")
+    args = parser.parse_args()
+
+    if args.build:
+        build_templates(model=args.model)
+        return
+
     total_clips = 0
     keywords = []
     for d in list_keyword_dirs():

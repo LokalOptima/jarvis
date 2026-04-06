@@ -15,6 +15,20 @@ add_subdirectory(lib/ggml)
 
 find_package(SDL2 REQUIRED)
 
+# ---- Engine configuration (compile-time decision) ----
+option(WHISPER_COREML "Enable Core ML (ANE) encoder" OFF)
+if(WHISPER_COREML)
+    enable_language(OBJCXX)
+    add_compile_definitions(WHISPER_USE_COREML WHISPER_COREML_ALLOW_FALLBACK)
+    add_compile_definitions(JARVIS_DEFAULT_MODEL="models/ggml-tiny-FP16.bin")
+    add_compile_definitions(JARVIS_ENGINE="coreml")
+    set(JARVIS_SUFFIX "-coreml")
+else()
+    add_compile_definitions(JARVIS_DEFAULT_MODEL="models/ggml-tiny-Q8.bin")
+    add_compile_definitions(JARVIS_ENGINE="cpu")
+    set(JARVIS_SUFFIX "-cpu")
+endif()
+
 # ---- Jarvis: wake word detector ----
 # Includes our patched whisper.cpp (encoder output + variable-length context)
 add_executable(jarvis
@@ -36,6 +50,13 @@ target_include_directories(jarvis PRIVATE
     lib/ggml/include
 )
 target_link_libraries(jarvis ggml ${SDL2_LIBRARIES})
+set_target_properties(jarvis PROPERTIES OUTPUT_NAME "jarvis${JARVIS_SUFFIX}")
+
+if(WHISPER_COREML)
+    target_sources(jarvis PRIVATE src/coreml/whisper-encoder.mm)
+    set_source_files_properties(src/coreml/whisper-encoder.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_link_libraries(jarvis "-framework CoreML" "-framework Foundation")
+endif()
 
 # ---- Jarvis client: lightweight mic streamer (SDL2 only, no whisper/ggml) ----
 add_executable(jarvis-client
@@ -59,6 +80,13 @@ target_include_directories(encode PRIVATE
     lib/ggml/include
 )
 target_link_libraries(encode ggml)
+set_target_properties(encode PROPERTIES OUTPUT_NAME "encode${JARVIS_SUFFIX}")
+
+if(WHISPER_COREML)
+    target_sources(encode PRIVATE src/coreml/whisper-encoder.mm)
+    set_source_files_properties(src/coreml/whisper-encoder.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_link_libraries(encode "-framework CoreML" "-framework Foundation")
+endif()
 
 # ---- Bench: model benchmark ----
 add_executable(bench
@@ -71,6 +99,12 @@ target_include_directories(bench PRIVATE
     lib/ggml/include
 )
 target_link_libraries(bench ggml)
+
+if(WHISPER_COREML)
+    target_sources(bench PRIVATE src/coreml/whisper-encoder.mm)
+    set_source_files_properties(src/coreml/whisper-encoder.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_link_libraries(bench "-framework CoreML" "-framework Foundation")
+endif()
 
 # ---- VAD test: validate Silero VAD C implementation ----
 add_executable(vad_test

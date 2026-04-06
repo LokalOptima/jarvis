@@ -104,6 +104,9 @@ int main(int argc, char **argv) {
     whisper_set_encoder_only(ctx, true);
 
     const int dim = whisper_model_n_audio_state(ctx);
+    // CoreML model expects exactly 200 mel frames (2s at 16kHz).
+    // Pad short clips to 2s so CoreML always gets the right shape.
+    static constexpr int MIN_SAMPLES = WHISPER_SAMPLE_RATE * 2;
     std::vector<float> pcm;
     std::vector<float> enc_out;
 
@@ -113,6 +116,17 @@ int main(int argc, char **argv) {
             write_empty_header(dim);
             continue;
         }
+
+        // Compute actual encoder frames from original audio length,
+        // then pad/clamp to exactly 2s for CoreML's fixed [1,80,200] input.
+        int orig_samples = (int)pcm.size();
+        int orig_mel = orig_samples / WHISPER_HOP_LENGTH;
+        int orig_enc_frames = (orig_mel + 1) / CONV_STRIDE;
+
+        if ((int)pcm.size() < MIN_SAMPLES)
+            pcm.resize(MIN_SAMPLES, 0.0f);
+        else if ((int)pcm.size() > MIN_SAMPLES)
+            pcm.resize(MIN_SAMPLES);
 
         if (whisper_pcm_to_mel(ctx, pcm.data(), pcm.size(), 1) != 0) {
             fprintf(stderr, "encode: mel failed for %s\n", argv[i]);
@@ -131,10 +145,11 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        int max_floats = audio_ctx * dim;
-        enc_out.resize(max_floats);
-        int n_floats = whisper_encoder_output(ctx, enc_out.data(), max_floats);
-        int n_frames = n_floats / dim;
+        // Output only frames from actual audio, not zero-padding
+        int n_frames = std::min(orig_enc_frames, audio_ctx);
+        if (n_frames <= 0) n_frames = 1;
+        enc_out.resize(n_frames * dim);
+        whisper_encoder_output(ctx, enc_out.data(), n_frames * dim);
 
         int32_t header[2] = { n_frames, dim };
         fwrite(header, 4, 2, stdout);
