@@ -1,0 +1,27 @@
+/**
+ * config.h - Jarvis server configuration (parsed from TOML).
+ */
+
+#pragma once
+
+#include <string>
+#include <vector>
+
+enum class KeywordMode { KEYWORD, VOICE };
+
+struct KeywordConfig {
+    std::string name;
+    KeywordMode mode = KeywordMode::KEYWORD;
+};
+
+struct Config {
+    std::string whisper;      // model filename, resolved to cache_dir
+    std::string vad;          // VAD model filename
+    std::string ding;         // "beep", "bling", "none"
+    float threshold = 0.35f;
+    std::vector<KeywordConfig> keywords;
+};
+
+// Load config from path, or ~/.config/jarvis/config.toml if empty.
+// Throws std::runtime_error on parse failure.
+Config load_config(const std::string &path = "");

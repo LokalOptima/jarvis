@@ -46,6 +46,7 @@ public:
     std::function<void(const std::string &name, float score,
                        std::shared_ptr<audio_async> audio)> on_detect;
     std::function<void()> on_ready;
+    std::function<void()> on_header;  // called after default header, before display
 
     Jarvis(const Jarvis &) = delete;
     Jarvis &operator=(const Jarvis &) = delete;

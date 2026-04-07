@@ -35,6 +35,9 @@ add_executable(jarvis
     src/jarvis.cpp
     src/detect.cpp
     src/playback.cpp
+    src/config.cpp
+    src/recorder.cpp
+    src/server.cpp
     src/vad_ggml.cpp
     src/whisper.cpp
     src/audio_async.cpp

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -206,8 +207,10 @@ DetectResult detect_once(
 //   line 3:  separator (render_separator redraws this)
 //
 // Cursor always rests after line 3. To update, move up and overwrite.
+// All render_* functions lock g_display_mu — safe to call from any thread.
 
 static constexpr int DISPLAY_LINES = 3;  // bar + status + separator
+static std::mutex g_display_mu;
 
 void render_separator() {
     fprintf(stderr, "\033[2m────────────────────────────────────────────────────\033[0m\033[K\n");
@@ -215,6 +218,7 @@ void render_separator() {
 }
 
 void render_clear() {
+    std::lock_guard<std::mutex> lk(g_display_mu);
     fprintf(stderr, "\033[%dA\r", DISPLAY_LINES);
     for (int i = 0; i < DISPLAY_LINES; i++)
         fprintf(stderr, "\033[2K\n");
@@ -222,14 +226,32 @@ void render_clear() {
     fflush(stderr);
 }
 
+void render_log(const char *msg) {
+    std::lock_guard<std::mutex> lk(g_display_mu);
+    fprintf(stderr, "\033[%dA\r", DISPLAY_LINES);
+    fprintf(stderr, "  \033[2m%s\033[0m\033[K\n", msg);
+    fprintf(stderr, "\033[K\n\033[K\n");
+    render_separator();
+}
+
+void render_header_field(int lines_above_display, const char *label, const char *value) {
+    std::lock_guard<std::mutex> lk(g_display_mu);
+    int up = DISPLAY_LINES + lines_above_display;
+    fprintf(stderr, "\033[%dA\r", up);
+    fprintf(stderr, "%10s: %s\033[K", label, value);
+    fprintf(stderr, "\033[%dB\r", up);
+    fflush(stderr);
+}
+
 void render_status(const char *keyword, float score, const char *time_str) {
-    // Move up to status line (1 above separator), overwrite, redraw separator
+    std::lock_guard<std::mutex> lk(g_display_mu);
     fprintf(stderr, "\033[%dA\r", DISPLAY_LINES - 1);
     fprintf(stderr, "  \033[2m[%s]\033[0m %s  %.2f\033[K\n", time_str, keyword, score);
     render_separator();
 }
 
 void render_bar(const char *name, float score, float threshold, int ms, bool silent) {
+    std::lock_guard<std::mutex> lk(g_display_mu);
     static char buf[768];
     char *p = buf;
 

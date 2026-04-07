@@ -1,0 +1,307 @@
+/**
+ * server.cpp - Jarvis Unix socket server.
+ *
+ * Threading model:
+ *   - Main thread: accept loop on Unix socket, reaps dead clients
+ *   - Detection thread: Jarvis::listen(audio) — owns mic, VAD + detection
+ *   - Per-client reader thread: reads subscribe messages, detects disconnect
+ *
+ * on_detect callback runs in the detection thread (blocks the loop):
+ *   1. Look up keyword mode from config
+ *   2. voice mode: play ding, vad_record(), build JSON + PCM
+ *   3. keyword mode: build JSON only
+ *   4. broadcast to subscribed clients
+ */
+
+#include "server.h"
+#include "jarvis.h"
+#include "detect.h"
+#include "playback.h"
+#include "recorder.h"
+#include "vad_ggml.h"
+#include <audio_async.hpp>
+#include <json.hpp>
+
+#include <atomic>
+#include <cerrno>
+#include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+using json = nlohmann::json;
+
+// ---- Client state ----
+
+struct Client {
+    int fd;
+    std::set<std::string> subscriptions;
+    std::mutex mu;  // protects subscriptions and fd writes
+    std::atomic<bool> alive{true};
+    std::thread reader;
+};
+
+// ---- Server state ----
+
+static std::mutex g_clients_mu;
+static std::vector<std::shared_ptr<Client>> g_clients;
+static std::atomic<bool> g_running{true};
+static int g_listen_fd = -1;
+
+static void add_client(std::shared_ptr<Client> c) {
+    std::lock_guard<std::mutex> lk(g_clients_mu);
+    g_clients.push_back(std::move(c));
+}
+
+// Update the "clients: N" header line only when the count changes.
+static std::atomic<int> g_last_client_count{-1};
+
+static void update_client_count() {
+    int n;
+    {
+        std::lock_guard<std::mutex> lk(g_clients_mu);
+        n = 0;
+        for (auto &c : g_clients) if (c->alive) n++;
+    }
+    int prev = g_last_client_count.exchange(n);
+    if (prev == n) return;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", n);
+    render_header_field(2, "clients", buf);
+}
+
+static void reap_clients() {
+    std::lock_guard<std::mutex> lk(g_clients_mu);
+    for (auto it = g_clients.begin(); it != g_clients.end(); ) {
+        if (!(*it)->alive) {
+            if ((*it)->reader.joinable()) (*it)->reader.join();
+            close((*it)->fd);
+            it = g_clients.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Write all bytes, handling partial writes. Returns false on failure.
+static bool write_all(int fd, const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, data + sent, len - sent);
+        if (n <= 0) return false;
+        sent += n;
+    }
+    return true;
+}
+
+static bool send_to(Client &c, const std::string &jsonl,
+                    const float *pcm = nullptr, int n_samples = 0) {
+    std::lock_guard<std::mutex> lk(c.mu);
+    if (!c.alive) return false;
+
+    if (!write_all(c.fd, jsonl.data(), jsonl.size())) { c.alive = false; return false; }
+
+    if (pcm && n_samples > 0) {
+        if (!write_all(c.fd, reinterpret_cast<const char *>(pcm), n_samples * sizeof(float))) {
+            c.alive = false;
+            return false;
+        }
+    }
+    return true;
+}
+
+// Snapshot subscribed clients, then send outside the global lock.
+static void broadcast(const std::string &keyword, const std::string &jsonl,
+                      const float *pcm = nullptr, int n_samples = 0) {
+    std::vector<std::shared_ptr<Client>> targets;
+    {
+        std::lock_guard<std::mutex> lk(g_clients_mu);
+        for (auto &c : g_clients) {
+            if (c->alive && c->subscriptions.count(keyword))
+                targets.push_back(c);
+        }
+    }
+    for (auto &c : targets)
+        send_to(*c, jsonl, pcm, n_samples);
+}
+
+// ---- Client reader thread ----
+
+static void client_reader(std::shared_ptr<Client> c) {
+    char buf[4096];
+    std::string line;
+
+    while (c->alive && g_running) {
+        ssize_t n = read(c->fd, buf, sizeof(buf));
+        if (n <= 0) { c->alive = false; return; }
+
+        line.append(buf, n);
+
+        // Process complete lines
+        size_t pos;
+        while ((pos = line.find('\n')) != std::string::npos) {
+            std::string msg = line.substr(0, pos);
+            line.erase(0, pos + 1);
+
+            if (msg.empty()) continue;
+
+            try {
+                auto j = json::parse(msg);
+                if (j.contains("subscribe") && j["subscribe"].is_array()) {
+                    std::lock_guard<std::mutex> lk(c->mu);
+                    c->subscriptions.clear();
+                    for (auto &k : j["subscribe"])
+                        if (k.is_string()) c->subscriptions.insert(k.get<std::string>());
+                }
+            } catch (...) {
+                // Ignore malformed messages
+            }
+        }
+    }
+}
+
+// ---- Server ----
+
+void jarvis_serve(const Config &config,
+                  const std::string &socket_path,
+                  int device_id) {
+    // Resolve model paths
+    std::string cd = cache_dir();
+    std::string whisper_path = cd + "/" + config.whisper;
+    std::string vad_path     = cd + "/" + config.vad;
+    std::string tag          = model_tag(whisper_path);
+
+    // Load recording VAD (separate instance from detection VAD)
+    SileroVad record_vad;
+    if (!record_vad.load(vad_path))
+        throw std::runtime_error("Failed to load recording VAD: " + diagnose_path(vad_path));
+
+    // Set up Jarvis detection engine
+    Jarvis j(whisper_path, vad_path);
+
+    // Load ding sound
+    std::string ding_path;
+    if (config.ding != "none") {
+        ding_path = "data/" + config.ding + ".wav";
+        j.set_ding(ding_path);
+    }
+
+    // Register keywords
+    for (auto &kw : config.keywords)
+        j.add_keyword({kw.name, template_path(kw.name, tag), config.threshold});
+
+    // Set up Unix socket
+    g_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (g_listen_fd < 0)
+        throw std::runtime_error(std::string("socket: ") + strerror(errno));
+
+    struct sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
+
+    unlink(socket_path.c_str());  // remove stale socket
+
+    if (bind(g_listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(g_listen_fd);
+        throw std::runtime_error(std::string("bind: ") + strerror(errno));
+    }
+
+    if (listen(g_listen_fd, 8) < 0) {
+        close(g_listen_fd);
+        throw std::runtime_error(std::string("listen: ") + strerror(errno));
+    }
+
+    // Header extension: socket + clients lines (updated live)
+    j.on_header = [&]() {
+        fprintf(stderr, "    socket: %s\n", socket_path.c_str());
+        fprintf(stderr, "   clients: 0\n");
+    };
+
+    // Signal handling
+    g_running = true;
+    std::signal(SIGINT, [](int) {
+        g_running = false;
+        if (g_listen_fd >= 0) { shutdown(g_listen_fd, SHUT_RDWR); close(g_listen_fd); g_listen_fd = -1; }
+    });
+    std::signal(SIGPIPE, SIG_IGN);
+
+    // on_detect callback: build event, optionally record, broadcast
+    j.on_detect = [&](const std::string &name, float score,
+                      std::shared_ptr<audio_async> audio) {
+        KeywordMode mode = KeywordMode::KEYWORD;
+        for (auto &kw : config.keywords)
+            if (kw.name == name) { mode = kw.mode; break; }
+
+        json evt;
+        evt["keyword"] = name;
+        evt["score"] = score;
+
+        if (mode == KeywordMode::VOICE) {
+            RecordResult rec = vad_record(record_vad, audio);
+            evt["audio_length"] = (int)rec.pcm.size();
+            std::string line = evt.dump() + "\n";
+            broadcast(name, line, rec.pcm.data(), rec.pcm.size());
+        } else {
+            std::string line = evt.dump() + "\n";
+            broadcast(name, line);
+        }
+    };
+
+    // Start detection in a background thread
+    auto audio_src = std::make_shared<audio_async>(static_cast<int>(JARVIS_BUFFER_SEC * 1000));
+    audio_src->init(device_id, JARVIS_SAMPLE_RATE);
+    audio_src->resume();
+
+    std::thread detect_thread([&]() {
+        j.listen(audio_src);
+    });
+
+    // Accept loop with periodic reaping
+    struct pollfd pfd = { g_listen_fd, POLLIN, 0 };
+    while (g_running) {
+        int ret = poll(&pfd, 1, 1000);  // 1s timeout for reaping
+        if (ret <= 0 || !(pfd.revents & POLLIN)) {
+            reap_clients();
+            update_client_count();
+            continue;
+        }
+
+        int cfd = accept(g_listen_fd, nullptr, nullptr);
+        if (cfd < 0) continue;
+
+        auto client = std::make_shared<Client>();
+        client->fd = cfd;
+        client->reader = std::thread(client_reader, client);
+        add_client(client);
+        update_client_count();
+
+        reap_clients();
+        update_client_count();
+    }
+
+    // Shutdown
+    j.stop();
+    if (detect_thread.joinable()) detect_thread.join();
+
+    // Close all clients
+    {
+        std::lock_guard<std::mutex> lk(g_clients_mu);
+        for (auto &c : g_clients) {
+            c->alive = false;
+            shutdown(c->fd, SHUT_RDWR);
+        }
+    }
+    reap_clients();
+
+    unlink(socket_path.c_str());
+    if (g_listen_fd >= 0) close(g_listen_fd);
+    fprintf(stderr, "Server stopped.\n");
+}

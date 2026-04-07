@@ -90,8 +90,10 @@ void Jarvis::print_header() {
     fprintf(stderr,
         "\033[2m───\033[0m jarvis \033[2m"
         "─────────────────────────────────────────\033[0m\n");
-    fprintf(stderr, "    engine: %s\n", JARVIS_ENGINE);
-    fprintf(stderr, "  keywords: %s\n\n", kw_list.c_str());
+    fprintf(stderr, "    engine: %s \033[2m[%s]\033[0m\n", JARVIS_ENGINE, cache_dir().c_str());
+    fprintf(stderr, "  keywords: %s\n", kw_list.c_str());
+    if (on_header) on_header();
+    fprintf(stderr, "\n");
     fflush(stderr);
 }
 

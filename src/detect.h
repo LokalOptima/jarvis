@@ -90,6 +90,8 @@ DetectResult detect_once(
 // Terminal display.
 void render_bar(const char *name, float score, float threshold, int ms, bool silent);
 void render_status(const char *keyword, float score, const char *time_str);
+void render_log(const char *msg);      // print a line above the display without clobbering it
+void render_header_field(int lines_above_display, const char *label, const char *value);
 void render_separator();
 void render_clear();  // clean up on exit
 
