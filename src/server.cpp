@@ -1,8 +1,13 @@
 /**
- * server.cpp - Jarvis Unix socket server.
+ * server.cpp - Jarvis detection server.
+ *
+ * Supports both Unix sockets and TCP:
+ *   /tmp/jarvis.sock        → Unix socket
+ *   tcp:9090                → TCP on all interfaces
+ *   tcp:127.0.0.1:9090      → TCP on localhost
  *
  * Threading model:
- *   - Main thread: accept loop on Unix socket, reaps dead clients
+ *   - Main thread: accept loop, reaps dead clients
  *   - Detection thread: Jarvis::listen(audio) — owns mic, VAD + detection
  *   - Per-client reader thread: reads subscribe messages, detects disconnect
  *
@@ -30,6 +35,8 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -168,10 +175,74 @@ static void client_reader(std::shared_ptr<Client> c) {
     }
 }
 
+// ---- Listener ----
+
+static bool is_tcp(const std::string &addr) { return addr.rfind("tcp:", 0) == 0; }
+
+static int create_listener(const std::string &addr) {
+    if (is_tcp(addr)) {
+        std::string rest = addr.substr(4);
+        std::string host = "0.0.0.0";
+        int port;
+
+        auto colon = rest.rfind(':');
+        if (colon != std::string::npos) {
+            host = rest.substr(0, colon);
+            port = std::stoi(rest.substr(colon + 1));
+        } else {
+            port = std::stoi(rest);
+        }
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) throw std::runtime_error(std::string("socket: ") + strerror(errno));
+
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in sa = {};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(port);
+        inet_pton(AF_INET, host.c_str(), &sa.sin_addr);
+
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+            close(fd);
+            throw std::runtime_error(std::string("bind: ") + strerror(errno));
+        }
+        if (listen(fd, 8) < 0) {
+            close(fd);
+            throw std::runtime_error(std::string("listen: ") + strerror(errno));
+        }
+        return fd;
+    } else {
+        std::string path = addr;
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) throw std::runtime_error(std::string("socket: ") + strerror(errno));
+
+        struct sockaddr_un sa = {};
+        sa.sun_family = AF_UNIX;
+        strncpy(sa.sun_path, path.c_str(), sizeof(sa.sun_path) - 1);
+        unlink(path.c_str());
+
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+            close(fd);
+            throw std::runtime_error(std::string("bind: ") + strerror(errno));
+        }
+        if (listen(fd, 8) < 0) {
+            close(fd);
+            throw std::runtime_error(std::string("listen: ") + strerror(errno));
+        }
+        return fd;
+    }
+}
+
+static void cleanup_listener(const std::string &addr) {
+    if (!is_tcp(addr)) unlink(addr.c_str());
+}
+
 // ---- Server ----
 
 void jarvis_serve(const Config &config,
-                  const std::string &socket_path,
+                  const std::string &listen_addr,
                   int device_id) {
     // Resolve model paths
     std::string cd = cache_dir();
@@ -198,30 +269,12 @@ void jarvis_serve(const Config &config,
     for (auto &kw : config.keywords)
         j.add_keyword({kw.name, template_path(kw.name, tag), config.threshold});
 
-    // Set up Unix socket
-    g_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (g_listen_fd < 0)
-        throw std::runtime_error(std::string("socket: ") + strerror(errno));
+    // Set up listener (Unix socket or TCP)
+    g_listen_fd = create_listener(listen_addr);
 
-    struct sockaddr_un addr = {};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
-
-    unlink(socket_path.c_str());  // remove stale socket
-
-    if (bind(g_listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(g_listen_fd);
-        throw std::runtime_error(std::string("bind: ") + strerror(errno));
-    }
-
-    if (listen(g_listen_fd, 8) < 0) {
-        close(g_listen_fd);
-        throw std::runtime_error(std::string("listen: ") + strerror(errno));
-    }
-
-    // Header extension: socket + clients lines (updated live)
+    // Header extension: listen address + clients count (updated live)
     j.on_header = [&]() {
-        fprintf(stderr, "    socket: %s\n", socket_path.c_str());
+        fprintf(stderr, "    listen: %s\n", listen_addr.c_str());
         fprintf(stderr, "   clients: 0\n");
     };
 
@@ -301,7 +354,7 @@ void jarvis_serve(const Config &config,
     }
     reap_clients();
 
-    unlink(socket_path.c_str());
+    cleanup_listener(listen_addr);
     if (g_listen_fd >= 0) close(g_listen_fd);
     fprintf(stderr, "Server stopped.\n");
 }

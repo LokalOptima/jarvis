@@ -32,6 +32,7 @@ Config load_config(const std::string &path) {
     cfg.whisper   = tbl["whisper"].value_or(std::string(JARVIS_DEFAULT_MODEL));
     cfg.vad       = tbl["vad"].value_or(std::string("silero_vad.bin"));
     cfg.ding      = tbl["ding"].value_or(std::string("beep"));
+    cfg.listen    = tbl["listen"].value_or(std::string("/tmp/jarvis.sock"));
     cfg.threshold = tbl["threshold"].value_or(0.35f);
 
     if (auto arr = tbl["keywords"].as_array()) {

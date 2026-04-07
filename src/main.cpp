@@ -23,6 +23,7 @@ struct Args {
     std::string vad_model   = cache_dir() + "/silero_vad.bin";
     std::string ding        = cache_dir() + "/beep.wav";
     std::string config_path;
+    std::string listen_addr;
     bool serve        = false;
     bool list_devices = false;
     int  device_id    = -1;
@@ -43,6 +44,8 @@ static Args parse_args(int argc, char **argv) {
             args.serve = true;
         } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             args.config_path = argv[++i];
+        } else if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
+            args.listen_addr = argv[++i];
         } else if (strcmp(argv[i], "--list-devices") == 0) {
             args.list_devices = true;
         } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
@@ -55,8 +58,9 @@ static Args parse_args(int argc, char **argv) {
                 "  --vad PATH         VAD model (default: silero_vad.bin)\n"
                 "  --ding NAME        detection sound: beep, bling, none (default: beep)\n\n"
                 "Server mode:\n"
-                "  --serve            start Unix socket server\n"
-                "  --config PATH      config file (default: ~/.config/jarvis/config.toml)\n\n"
+                "  --serve            start detection server\n"
+                "  --config PATH      config file (default: ~/.config/jarvis/config.toml)\n"
+                "  --listen ADDR      /path/to/sock, tcp:PORT, tcp:HOST:PORT\n\n"
                 "Audio:\n"
                 "  --list-devices     list SDL2 capture devices and exit\n"
                 "  --device N         capture device index (-1 = default)\n\n"
@@ -92,7 +96,9 @@ int main(int argc, char **argv) {
 
     if (args.serve) {
         Config cfg = load_config(args.config_path);
-        jarvis_serve(cfg, "/tmp/jarvis.sock", args.device_id);
+        std::string addr = args.listen_addr.empty() ? cfg.listen : args.listen_addr;
+        if (addr.empty()) addr = "/tmp/jarvis.sock";
+        jarvis_serve(cfg, addr, args.device_id);
     } else {
         std::string tag = model_tag(args.model);
 

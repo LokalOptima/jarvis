@@ -18,6 +18,7 @@ struct Config {
     std::string whisper;      // model filename, resolved to cache_dir
     std::string vad;          // VAD model filename
     std::string ding;         // "beep", "bling", "none"
+    std::string listen;       // "/tmp/jarvis.sock" or "tcp:9090"
     float threshold = 0.35f;
     std::vector<KeywordConfig> keywords;
 };

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test client for jarvis Unix socket server."""
+"""Test client for jarvis detection server (Unix socket or TCP)."""
 
 import argparse
 import json
@@ -9,17 +9,34 @@ import sys
 import wave
 import tempfile
 
+
+def connect(addr: str) -> socket.socket:
+    """Connect to server. addr is a path (Unix) or tcp:host:port / tcp:port."""
+    if addr.startswith("tcp:"):
+        rest = addr[4:]
+        if ":" in rest:
+            host, port = rest.rsplit(":", 1)
+        else:
+            host, port = "127.0.0.1", rest
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host, int(port)))
+    else:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(addr)
+    return sock
+
+
 def main():
     p = argparse.ArgumentParser(description="Jarvis test client")
     p.add_argument("keywords", nargs="*", default=["hey_jarvis", "weather"],
                    help="Keywords to subscribe to (default: hey_jarvis weather)")
-    p.add_argument("--socket", default="/tmp/jarvis.sock", help="Socket path")
+    p.add_argument("--addr", default="/tmp/jarvis.sock",
+                   help="Server address: /path/to/sock or tcp:host:port (default: /tmp/jarvis.sock)")
     p.add_argument("--save-audio", action="store_true",
                    help="Save voice recordings as WAV files")
     args = p.parse_args()
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(args.socket)
+    sock = connect(args.addr)
 
     sub = json.dumps({"subscribe": args.keywords}) + "\n"
     sock.sendall(sub.encode())
