@@ -17,12 +17,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <sys/stat.h>
 
 struct Args {
     std::string model       = cache_dir() + "/" + JARVIS_DEFAULT_MODEL;
     std::string vad_model   = cache_dir() + "/silero_vad.bin";
-    std::string ding        = "data/beep.wav";
+    std::string ding        = cache_dir() + "/beep.wav";
     std::string config_path;
     bool serve        = false;
     bool list_devices = false;
@@ -39,7 +38,7 @@ static Args parse_args(int argc, char **argv) {
         } else if (strcmp(argv[i], "--ding") == 0 && i + 1 < argc) {
             const char *v = argv[++i];
             if (strcmp(v, "none") == 0) args.ding = "";
-            else args.ding = std::string("data/") + v + ".wav";
+            else args.ding = cache_dir() + "/" + v + ".wav";
         } else if (strcmp(argv[i], "--serve") == 0) {
             args.serve = true;
         } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
@@ -89,16 +88,6 @@ int main(int argc, char **argv) {
     if (args.list_devices) {
         list_sdl_devices();
         return 0;
-    }
-
-    struct stat st;
-    if (stat(cache_dir().c_str(), &st) != 0) {
-        fprintf(stderr, "Model directory not found: %s\n"
-                        "Create it and place model files there:\n"
-                        "  mkdir -p %s/templates\n"
-                        "  # copy ggml-tiny.bin, silero_vad.bin, and templates\n",
-                        cache_dir().c_str(), cache_dir().c_str());
-        return 1;
     }
 
     if (args.serve) {

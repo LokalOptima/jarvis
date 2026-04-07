@@ -94,7 +94,7 @@ def write_binary(weights: dict[str, np.ndarray], out_path: str):
 def main():
     parser = argparse.ArgumentParser(description="Export Silero VAD weights")
     parser.add_argument("-m", "--model", default=str(Path.home() / "models/silero_vad.onnx"))
-    parser.add_argument("-o", "--output", default="models/silero_vad.bin")
+    parser.add_argument("-o", "--output", default=str(Path.home() / ".cache" / "jarvis" / "silero_vad.bin"))
     args = parser.parse_args()
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)

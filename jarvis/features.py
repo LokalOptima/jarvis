@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from jarvis import MODELS_DIR
+from jarvis import CACHE_DIR
 
 BUILD_DIR = Path(__file__).parent.parent / "build"
 
@@ -27,11 +27,11 @@ def _find_encode_bin() -> Path:
 
 def _find_default_model() -> Path:
     for name in ("ggml-tiny-FP16.bin", "ggml-tiny-Q8.bin"):
-        p = MODELS_DIR / name
+        p = CACHE_DIR / name
         if p.exists():
             return p
     raise FileNotFoundError(
-        "No model found. Expected models/ggml-tiny-FP16.bin or models/ggml-tiny-Q8.bin."
+        f"No model found in {CACHE_DIR}/. Run 'make' to download models."
     )
 
 

@@ -23,7 +23,7 @@ import whisper.model
 # Disable SDPA for stable tracing across torch versions.
 whisper.model.MultiHeadAttention.use_sdpa = False
 
-MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+from jarvis import CACHE_DIR
 
 # 2 seconds of audio at 16kHz → 200 mel frames → 100 encoder frames after stride-2 conv
 N_MELS = 80
@@ -59,7 +59,7 @@ def convert_encoder(model_name: str, quantize_f16: bool = False) -> Path:
         compute_precision=ct.precision.FLOAT16 if quantize_f16 else ct.precision.FLOAT32,
     )
 
-    mlpackage_path = MODELS_DIR / f"ggml-{model_name}-FP16-encoder.mlpackage"
+    mlpackage_path = CACHE_DIR / f"ggml-{model_name}-FP16-encoder.mlpackage"
     ml_model.save(str(mlpackage_path))
     print(f"Saved mlpackage: {mlpackage_path}")
 
@@ -68,7 +68,7 @@ def convert_encoder(model_name: str, quantize_f16: bool = False) -> Path:
 
 def compile_model(mlpackage_path: Path, model_name: str) -> Path:
     """Compile .mlpackage to .mlmodelc using coremltools."""
-    target_path = MODELS_DIR / f"ggml-{model_name}-FP16-encoder.mlmodelc"
+    target_path = CACHE_DIR / f"ggml-{model_name}-FP16-encoder.mlmodelc"
     if target_path.exists():
         shutil.rmtree(target_path)
 
@@ -90,7 +90,7 @@ def main():
     )
     args = parser.parse_args()
 
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     mlpackage_path = convert_encoder(args.model, args.quantize_f16)
     compile_model(mlpackage_path, args.model)

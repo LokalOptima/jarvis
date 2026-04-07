@@ -190,7 +190,7 @@ void jarvis_serve(const Config &config,
     // Load ding sound
     std::string ding_path;
     if (config.ding != "none") {
-        ding_path = "data/" + config.ding + ".wav";
+        ding_path = cd + "/" + config.ding + ".wav";
         j.set_ding(ding_path);
     }
 
