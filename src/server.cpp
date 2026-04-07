@@ -1,12 +1,10 @@
 /**
- * server.cpp - Jarvis detection server.
+ * server.cpp - Jarvis detection engine with optional socket server.
  *
- * Supports both Unix sockets and TCP:
- *   /tmp/jarvis.sock        → Unix socket
- *   tcp:9090                → TCP on all interfaces
- *   tcp:127.0.0.1:9090      → TCP on localhost
+ * If listen_addr is empty: standalone detection, no clients.
+ * If listen_addr is set: accepts client connections (Unix socket or TCP).
  *
- * Threading model:
+ * Threading model (with listener):
  *   - Main thread: accept loop, reaps dead clients
  *   - Detection thread: Jarvis::listen(audio) — owns mic, VAD + detection
  *   - Per-client reader thread: reads subscribe messages, detects disconnect
@@ -15,7 +13,7 @@
  *   1. Look up keyword mode from config
  *   2. voice mode: play ding, vad_record(), build JSON + PCM
  *   3. keyword mode: build JSON only
- *   4. broadcast to subscribed clients
+ *   4. broadcast to subscribed clients (if any)
  */
 
 #include "server.h"
@@ -269,13 +267,18 @@ void jarvis_serve(const Config &config,
     for (auto &kw : config.keywords)
         j.add_keyword({kw.name, template_path(kw.name, tag), config.threshold});
 
-    // Set up listener (Unix socket or TCP)
-    g_listen_fd = create_listener(listen_addr);
+    bool has_listener = !listen_addr.empty();
 
-    // Header extension: listen address + clients count (updated live)
+    // Set up listener (Unix socket or TCP) if configured
+    if (has_listener)
+        g_listen_fd = create_listener(listen_addr);
+
+    // Header extension
     j.on_header = [&]() {
-        fprintf(stderr, "    listen: %s\n", listen_addr.c_str());
-        fprintf(stderr, "   clients: 0\n");
+        if (has_listener) {
+            fprintf(stderr, "    listen: %s\n", listen_addr.c_str());
+            fprintf(stderr, "   clients: 0\n");
+        }
     };
 
     // Signal handling
@@ -300,61 +303,76 @@ void jarvis_serve(const Config &config,
         if (mode == KeywordMode::VOICE) {
             RecordResult rec = vad_record(record_vad, audio);
             evt["audio_length"] = (int)rec.pcm.size();
-            std::string line = evt.dump() + "\n";
-            broadcast(name, line, rec.pcm.data(), rec.pcm.size());
-        } else {
+            float audio_sec = (float)rec.pcm.size() / JARVIS_SAMPLE_RATE;
+
+            auto now = std::chrono::system_clock::now();
+            auto tt = std::chrono::system_clock::to_time_t(now);
+            char tbuf[32];
+            std::strftime(tbuf, sizeof(tbuf), "%H:%M:%S", std::localtime(&tt));
+            render_status(name.c_str(), score, tbuf, audio_sec);
+
+            if (has_listener) {
+                std::string line = evt.dump() + "\n";
+                broadcast(name, line, rec.pcm.data(), rec.pcm.size());
+            }
+        } else if (has_listener) {
             std::string line = evt.dump() + "\n";
             broadcast(name, line);
         }
     };
 
-    // Start detection in a background thread
-    auto audio_src = std::make_shared<audio_async>(static_cast<int>(JARVIS_BUFFER_SEC * 1000));
+    // Start detection
+    auto audio_src = std::make_shared<audio_async>(JARVIS_BUFFER_MS);
     audio_src->init(device_id, JARVIS_SAMPLE_RATE);
     audio_src->resume();
 
-    std::thread detect_thread([&]() {
-        j.listen(audio_src);
-    });
+    if (has_listener) {
+        // Server mode: detection in background thread, accept loop in main thread
+        std::thread detect_thread([&]() {
+            j.listen(audio_src);
+        });
 
-    // Accept loop with periodic reaping
-    struct pollfd pfd = { g_listen_fd, POLLIN, 0 };
-    while (g_running) {
-        int ret = poll(&pfd, 1, 1000);  // 1s timeout for reaping
-        if (ret <= 0 || !(pfd.revents & POLLIN)) {
+        struct pollfd pfd = { g_listen_fd, POLLIN, 0 };
+        while (g_running) {
+            int ret = poll(&pfd, 1, 1000);
+            if (ret <= 0 || !(pfd.revents & POLLIN)) {
+                reap_clients();
+                update_client_count();
+                continue;
+            }
+
+            int cfd = accept(g_listen_fd, nullptr, nullptr);
+            if (cfd < 0) continue;
+
+            auto client = std::make_shared<Client>();
+            client->fd = cfd;
+            client->reader = std::thread(client_reader, client);
+            add_client(client);
+            update_client_count();
+
             reap_clients();
             update_client_count();
-            continue;
         }
 
-        int cfd = accept(g_listen_fd, nullptr, nullptr);
-        if (cfd < 0) continue;
+        j.stop();
+        if (detect_thread.joinable()) detect_thread.join();
 
-        auto client = std::make_shared<Client>();
-        client->fd = cfd;
-        client->reader = std::thread(client_reader, client);
-        add_client(client);
-        update_client_count();
-
+        // Close all clients
+        {
+            std::lock_guard<std::mutex> lk(g_clients_mu);
+            for (auto &c : g_clients) {
+                c->alive = false;
+                shutdown(c->fd, SHUT_RDWR);
+            }
+        }
         reap_clients();
-        update_client_count();
+        cleanup_listener(listen_addr);
+        if (g_listen_fd >= 0) close(g_listen_fd);
+    } else {
+        // Standalone mode: detection in main thread, no socket
+        j.listen(audio_src);
     }
 
-    // Shutdown
-    j.stop();
-    if (detect_thread.joinable()) detect_thread.join();
-
-    // Close all clients
-    {
-        std::lock_guard<std::mutex> lk(g_clients_mu);
-        for (auto &c : g_clients) {
-            c->alive = false;
-            shutdown(c->fd, SHUT_RDWR);
-        }
-    }
-    reap_clients();
-
-    cleanup_listener(listen_addr);
-    if (g_listen_fd >= 0) close(g_listen_fd);
-    fprintf(stderr, "Server stopped.\n");
+    render_clear();
+    fprintf(stderr, "Stopped.\n");
 }

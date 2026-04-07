@@ -60,11 +60,8 @@ client: build/jarvis-client
 run: $(JARVIS_BIN)
 	./$(JARVIS_BIN)
 
-run-detect: $(JARVIS_BIN)
-	./$(JARVIS_BIN) --detect-only
-
-server: $(JARVIS_BIN)
-	./$(JARVIS_BIN) --server
+serve: $(JARVIS_BIN)
+	./$(JARVIS_BIN) --listen /tmp/jarvis.sock
 
 enroll:
 	uv run python -m jarvis.enroll
@@ -81,4 +78,4 @@ coreml:
 clean:
 	rm -rf build
 
-.PHONY: client run run-detect server enroll templates review coreml clean
+.PHONY: client run serve enroll templates review coreml clean

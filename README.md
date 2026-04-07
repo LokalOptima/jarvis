@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="jarvis.png" width="256" alt="jarvis">
+</p>
+
 # Jarvis — Personalized Wake Word Detector
 
 A CPU-only, privacy-first wake word detector that responds to a specific person saying a specific phrase. No cloud, no training data, no GPU. Enroll with a handful of recordings, and it runs forever on a single core.

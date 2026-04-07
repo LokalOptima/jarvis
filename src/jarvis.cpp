@@ -104,7 +104,7 @@ void Jarvis::listen() {
     s_instance = this;
     std::signal(SIGINT, [](int) { if (s_instance) s_instance->stop(); });
 
-    auto audio = std::make_shared<audio_async>(static_cast<int>(JARVIS_BUFFER_SEC * 1000));
+    auto audio = std::make_shared<audio_async>(JARVIS_BUFFER_MS);
     audio->init(-1, JARVIS_SAMPLE_RATE);
     audio->resume();
 
@@ -126,7 +126,7 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
     print_header();
 
     // Print initial display: bar + status + separator
-    fprintf(stderr, "  listening\033[K\n");
+    fprintf(stderr, "  warming up\033[K\n");
     fprintf(stderr, "  \033[2m—\033[0m\033[K\n");
     render_separator();
 
@@ -138,9 +138,26 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
     pcm_buffer.reserve(JARVIS_BUFFER_SAMPLES);
 
     float default_thr = impl->keywords[0].threshold;
+    bool warmed_up = false;
+    int skip_frames = 0;  // encoder frames to skip (after detection, excludes old keyword)
 
     while (m_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(JARVIS_SLIDE_MS));
+
+        // Wait for ring buffer to accumulate a full detection window
+        if (!warmed_up) {
+            if (audio->available() < JARVIS_BUFFER_SAMPLES) {
+                render_bar("warming up", 0.0f, default_thr, 0, true);
+                continue;
+            }
+            warmed_up = true;
+        }
+
+        // Decay skip as new audio slides in (1 encoder frame ≈ 20ms ≈ SLIDE_MS/10)
+        if (skip_frames > 0) {
+            int decay = JARVIS_SLIDE_MS * JARVIS_SAMPLE_RATE / (1000 * JARVIS_MEL_HOP * JARVIS_CONV_STRIDE);
+            skip_frames = std::max(0, skip_frames - decay);
+        }
 
         // VAD gate: check latest 200ms
         audio->get(JARVIS_SLIDE_MS, pcm_buffer);
@@ -152,16 +169,16 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
             if (impl->vad.process(pcm_buffer.data() + i) > 0.5f) { has_speech = true; break; }
         }
         if (!has_speech) {
-            render_bar("listening", 0.0f, default_thr, 0, true);
+            render_bar("silence", 0.0f, default_thr, 0, true);
             continue;
         }
 
-        // Speech detected: get full 2s buffer and run detection
-        audio->get(static_cast<int>(JARVIS_BUFFER_SEC * 1000), pcm_buffer);
-        if (pcm_buffer.empty()) continue;
+        // Speech detected: always fetch full 2s, skip old keyword in encoder output
+        audio->get(JARVIS_BUFFER_MS, pcm_buffer);
 
         DetectResult det = detect_once(impl->ctx, impl->keywords,
-                                       pcm_buffer.data(), pcm_buffer.size(), scratch);
+                                       pcm_buffer.data(), pcm_buffer.size(), scratch,
+                                       skip_frames);
 
         int show_kw = det.keyword_index >= 0 ? det.keyword_index : det.best_keyword;
         float show_score = det.keyword_index >= 0 ? det.score : det.best_score;
@@ -183,8 +200,9 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
 
             if (on_detect) on_detect(kw.name, det.score, audio);
 
+            // Skip past the detected keyword on subsequent cycles
+            skip_frames = det.end_frame;
             impl->vad.reset();
-            audio->clear();
         }
     }
 }

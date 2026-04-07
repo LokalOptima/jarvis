@@ -114,6 +114,11 @@ void audio_async::callback(uint8_t *stream, int len) {
     push(reinterpret_cast<const float *>(stream), len / sizeof(float));
 }
 
+size_t audio_async::available() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_audio_len;
+}
+
 void audio_async::get(int ms, std::vector<float> &result) {
     result.clear();
     if (m_audio.empty() || !m_running) return;

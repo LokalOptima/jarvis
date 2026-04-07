@@ -74,13 +74,15 @@ static float subdtw(const float *input, int n_input,
                     const Template &tmpl,
                     const std::vector<float> &inv_norms,
                     std::vector<float> &prev_row,
-                    std::vector<float> &curr_row) {
+                    std::vector<float> &curr_row,
+                    int *best_end_out = nullptr) {
     int n_tmpl = tmpl.n_frames;
     prev_row.resize(n_tmpl + 1);
     curr_row.resize(n_tmpl + 1);
     std::fill(prev_row.begin(), prev_row.end(), 1e30f);
     prev_row[0] = 0.0f;
     float best = 1e30f;
+    int best_end = 0;
 
     for (int i = 1; i <= n_input; i++) {
         curr_row[0] = 0.0f;
@@ -94,20 +96,23 @@ static float subdtw(const float *input, int n_input,
             if (del < best_prev) best_prev = del;
             curr_row[j] = c + best_prev;
         }
-        if (curr_row[n_tmpl] < best) best = curr_row[n_tmpl];
+        if (curr_row[n_tmpl] < best) { best = curr_row[n_tmpl]; best_end = i; }
         std::swap(prev_row, curr_row);
     }
+    if (best_end_out) *best_end_out = best_end;
     return best / n_tmpl;
 }
 
 float Templates::match(const float *input, int n_frames,
                        const std::vector<float> &inv_norms,
-                       std::vector<float> &row_a, std::vector<float> &row_b) const {
+                       std::vector<float> &row_a, std::vector<float> &row_b,
+                       int *end_frame) const {
     float best_sim = -1.0f;
     for (const auto &tmpl : items) {
-        float cost = subdtw(input, n_frames, tmpl, inv_norms, row_a, row_b);
+        int end = 0;
+        float cost = subdtw(input, n_frames, tmpl, inv_norms, row_a, row_b, &end);
         float sim = 1.0f - cost;
-        if (sim > best_sim) best_sim = sim;
+        if (sim > best_sim) { best_sim = sim; if (end_frame) *end_frame = end; }
     }
     return best_sim;
 }
@@ -146,7 +151,8 @@ DetectResult detect_once(
     whisper_context *ctx,
     const std::vector<LoadedKeyword> &keywords,
     const float *pcm, int n_samples,
-    DetectScratch &scratch)
+    DetectScratch &scratch,
+    int skip_frames)
 {
     DetectResult result;
     auto t0 = std::chrono::steady_clock::now();
@@ -174,16 +180,18 @@ DetectResult detect_once(
     if (n_floats <= 0) return result;
 
     int n_enc_frames = n_floats / JARVIS_DIM;
-    float *enc_ptr = scratch.encoder_output.data() + JARVIS_ONSET_SKIP * JARVIS_DIM;
-    n_enc_frames -= JARVIS_ONSET_SKIP;
+    int total_skip = JARVIS_ONSET_SKIP + skip_frames;
+    float *enc_ptr = scratch.encoder_output.data() + total_skip * JARVIS_DIM;
+    n_enc_frames -= total_skip;
     if (n_enc_frames <= 0) return result;
 
     apply_cmvn(enc_ptr, n_enc_frames);
     Templates::compute_inv_norms(enc_ptr, n_enc_frames, scratch.inv_norms);
 
     for (int k = 0; k < (int)keywords.size(); k++) {
+        int end = 0;
         float score = keywords[k].templates.match(
-            enc_ptr, n_enc_frames, scratch.inv_norms, scratch.dtw_row_a, scratch.dtw_row_b);
+            enc_ptr, n_enc_frames, scratch.inv_norms, scratch.dtw_row_a, scratch.dtw_row_b, &end);
         if (score > result.best_score) {
             result.best_score = score;
             result.best_keyword = k;
@@ -191,6 +199,7 @@ DetectResult detect_once(
         if (result.keyword_index < 0 && score >= keywords[k].threshold) {
             result.keyword_index = k;
             result.score = score;
+            result.end_frame = end;
         }
     }
 
@@ -243,10 +252,15 @@ void render_header_field(int lines_above_display, const char *label, const char 
     fflush(stderr);
 }
 
-void render_status(const char *keyword, float score, const char *time_str) {
+void render_status(const char *keyword, float score, const char *time_str,
+                   float audio_sec) {
     std::lock_guard<std::mutex> lk(g_display_mu);
     fprintf(stderr, "\033[%dA\r", DISPLAY_LINES - 1);
-    fprintf(stderr, "  \033[2m[%s]\033[0m %s  %.2f\033[K\n", time_str, keyword, score);
+    if (audio_sec > 0)
+        fprintf(stderr, "  \033[2m[%s]\033[0m %s  %.2f \033[2m(%.1fs audio)\033[0m\033[K\n",
+                time_str, keyword, score, audio_sec);
+    else
+        fprintf(stderr, "  \033[2m[%s]\033[0m %s  %.2f\033[K\n", time_str, keyword, score);
     render_separator();
 }
 
@@ -257,7 +271,10 @@ void render_bar(const char *name, float score, float threshold, int ms, bool sil
 
     constexpr int NAME_W = 14;
     constexpr int W = 36;
-    int thr = std::max(0, std::min(W - 1, (int)(threshold * W)));
+    float range = threshold * 2.0f;  // bar covers 0 to 2x threshold
+    float norm_score = score / range;
+    float norm_thr = threshold / range;  // always at midpoint
+    int thr = std::max(0, std::min(W - 1, (int)(norm_thr * W)));
 
     // Move cursor to bar line
     p += std::snprintf(p, 32, "\033[%dA\r", DISPLAY_LINES);
@@ -269,7 +286,7 @@ void render_bar(const char *name, float score, float threshold, int ms, bool sil
     for (int i = copy; i < NAME_W; i++) *p++ = ' ';
 
     if (silent) {
-        int filled = std::max(0, std::min(W, (int)(score * W)));
+        int filled = std::max(0, std::min(W, (int)(norm_score * W)));
         memcpy(p, "\033[2m", 4); p += 4;
         for (int i = 0; i < W; i++) {
             if      (i < filled) { memcpy(p, "\xe2\x96\x88", 3); p += 3; }
@@ -278,7 +295,7 @@ void render_bar(const char *name, float score, float threshold, int ms, bool sil
         }
         memcpy(p, "\033[0m\033[K", 7); p += 7;
     } else {
-        int filled = std::max(0, std::min(W, (int)(score * W)));
+        int filled = std::max(0, std::min(W, (int)(norm_score * W)));
         static const char *esc[]  = { "\033[32m", "\033[1;31m", "\033[2m", "\033[33m" };
         static const int esc_len[] = { 5, 7, 4, 5 };
         int color = -1;

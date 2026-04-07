@@ -22,6 +22,7 @@ static constexpr int   JARVIS_MEL_HOP     = WHISPER_HOP_LENGTH;
 static constexpr int   JARVIS_CONV_STRIDE = 2;
 static constexpr int   JARVIS_ONSET_SKIP  = 2;
 static constexpr float JARVIS_STEP_PENALTY = 0.1f;
+static constexpr int   JARVIS_BUFFER_MS      = (int)(JARVIS_BUFFER_SEC * 1000);
 static constexpr int   JARVIS_BUFFER_SAMPLES = (int)(JARVIS_BUFFER_SEC * JARVIS_SAMPLE_RATE);
 static constexpr int   JARVIS_SLIDE_SAMPLES  = (JARVIS_SLIDE_MS * JARVIS_SAMPLE_RATE) / 1000;
 
@@ -44,7 +45,8 @@ struct Templates {
 
     float match(const float *input, int n_frames,
                 const std::vector<float> &inv_norms,
-                std::vector<float> &row_a, std::vector<float> &row_b) const;
+                std::vector<float> &row_a, std::vector<float> &row_b,
+                int *end_frame = nullptr) const;
 };
 
 // ---- Detection result ----
@@ -61,6 +63,7 @@ struct DetectResult {
     float score = 0.0f;
     int best_keyword = 0;     // highest-scoring keyword (even if below threshold)
     float best_score = -1.0f;
+    int end_frame = 0;        // encoder frame where best match ends (post onset-skip)
     int elapsed_ms = 0;
 };
 
@@ -80,16 +83,20 @@ struct DetectScratch {
 
 // Run one detection cycle: mel → encode → CMVN → DTW.
 // pcm/n_samples is the audio buffer (may be shorter than BUFFER_SAMPLES, will be zero-padded).
+// skip_frames: skip this many encoder frames (after onset skip) before CMVN/DTW.
+//   Used after detection to exclude the matched keyword from the next cycle.
 // Returns detection result. Does NOT check VAD — caller should do that.
 DetectResult detect_once(
     whisper_context *ctx,
     const std::vector<LoadedKeyword> &keywords,
     const float *pcm, int n_samples,
-    DetectScratch &scratch);
+    DetectScratch &scratch,
+    int skip_frames = 0);
 
 // Terminal display.
 void render_bar(const char *name, float score, float threshold, int ms, bool silent);
-void render_status(const char *keyword, float score, const char *time_str);
+void render_status(const char *keyword, float score, const char *time_str,
+                   float audio_sec = 0);
 void render_log(const char *msg);      // print a line above the display without clobbering it
 void render_header_field(int lines_above_display, const char *label, const char *value);
 void render_separator();
