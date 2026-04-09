@@ -84,10 +84,14 @@ static float subdtw(const float *input, int n_input,
     float best = 1e30f;
     int best_end = 0;
 
+    int anchor_end = n_tmpl - JARVIS_ANCHOR_FRAMES;
+
     for (int i = 1; i <= n_input; i++) {
         curr_row[0] = 0.0f;
         for (int j = 1; j <= n_tmpl; j++) {
             float c = 1.0f - cosine_dot(input + (i - 1) * JARVIS_DIM, tmpl.frame(j - 1), inv_norms[i - 1]);
+            if (j <= JARVIS_ANCHOR_FRAMES || j > anchor_end)
+                c *= JARVIS_ANCHOR_WEIGHT;
             float diag = prev_row[j - 1];
             float ins  = prev_row[j] + JARVIS_STEP_PENALTY;
             float del  = curr_row[j - 1] + JARVIS_STEP_PENALTY;
@@ -191,12 +195,16 @@ DetectResult detect_once(
     for (int k = 0; k < (int)keywords.size(); k++) {
         int end = 0;
         float score = keywords[k].templates.match(
-            enc_ptr, n_enc_frames, scratch.inv_norms, scratch.dtw_row_a, scratch.dtw_row_b, &end);
+            enc_ptr, n_enc_frames, scratch.inv_norms,
+            scratch.dtw_row_a, scratch.dtw_row_b, &end);
         if (score > result.best_score) {
             result.best_score = score;
             result.best_keyword = k;
         }
         if (result.keyword_index < 0 && score >= keywords[k].threshold) {
+            char dbg[128];
+            snprintf(dbg, sizeof(dbg), "%s  score=%.2f", keywords[k].name.c_str(), score);
+            render_log(dbg);
             result.keyword_index = k;
             result.score = score;
             result.end_frame = end;

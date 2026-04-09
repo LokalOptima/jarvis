@@ -19,7 +19,7 @@ struct Config {
     std::string vad;          // VAD model filename
     std::string ding;         // "beep", "bling", "none"
     std::string listen;       // "/tmp/jarvis.sock", "tcp:9090", or "" (no server)
-    float threshold = 0.35f;
+    float threshold = 0.25f;
     std::vector<KeywordConfig> keywords;
 };
 

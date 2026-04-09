@@ -60,6 +60,7 @@ static std::mutex g_clients_mu;
 static std::vector<std::shared_ptr<Client>> g_clients;
 static std::atomic<bool> g_running{true};
 static int g_listen_fd = -1;
+static Jarvis *g_jarvis = nullptr;
 
 static void add_client(std::shared_ptr<Client> c) {
     std::lock_guard<std::mutex> lk(g_clients_mu);
@@ -282,9 +283,11 @@ void jarvis_serve(const Config &config,
     };
 
     // Signal handling
+    g_jarvis = &j;
     g_running = true;
     std::signal(SIGINT, [](int) {
         g_running = false;
+        if (g_jarvis) g_jarvis->stop();
         if (g_listen_fd >= 0) { shutdown(g_listen_fd, SHUT_RDWR); close(g_listen_fd); g_listen_fd = -1; }
     });
     std::signal(SIGPIPE, SIG_IGN);

@@ -52,7 +52,6 @@ Config load_config(const std::string &path) {
     cfg.whisper   = JARVIS_DEFAULT_MODEL;
     cfg.vad       = "silero_vad.bin";
     cfg.ding      = "beep";
-    cfg.threshold = 0.35f;
 
     // Try parsing config file — use defaults if it doesn't exist
     FILE *f = fopen(file.c_str(), "r");

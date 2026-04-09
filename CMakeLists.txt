@@ -29,9 +29,8 @@ else()
     set(JARVIS_SUFFIX "-cpu")
 endif()
 
-# ---- Jarvis: wake word detector ----
-add_executable(jarvis
-    src/main.cpp
+# ---- Jarvis: static library (for embedding in other projects) ----
+add_library(jarvis_lib STATIC
     src/jarvis.cpp
     src/detect.cpp
     src/playback.cpp
@@ -42,20 +41,24 @@ add_executable(jarvis
     src/whisper.cpp
     src/audio_async.cpp
 )
-target_include_directories(jarvis PRIVATE
+target_include_directories(jarvis_lib PUBLIC
     ${SDL2_INCLUDE_DIRS}
-    src
-    lib
-    lib/ggml/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/ggml/include
 )
-target_link_libraries(jarvis ggml ${SDL2_LIBRARIES})
-set_target_properties(jarvis PROPERTIES OUTPUT_NAME "jarvis${JARVIS_SUFFIX}")
+target_link_libraries(jarvis_lib PUBLIC ggml ${SDL2_LIBRARIES})
 
 if(WHISPER_COREML)
-    target_sources(jarvis PRIVATE src/coreml/whisper-encoder.mm)
+    target_sources(jarvis_lib PRIVATE src/coreml/whisper-encoder.mm)
     set_source_files_properties(src/coreml/whisper-encoder.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-    target_link_libraries(jarvis "-framework CoreML" "-framework Foundation")
+    target_link_libraries(jarvis_lib PUBLIC "-framework CoreML" "-framework Foundation")
 endif()
+
+# ---- Jarvis: wake word detector ----
+add_executable(jarvis src/main.cpp)
+target_link_libraries(jarvis jarvis_lib)
+set_target_properties(jarvis PROPERTIES OUTPUT_NAME "jarvis${JARVIS_SUFFIX}")
 
 # ---- Encode: extract encoder embeddings from WAV files ----
 add_executable(encode
