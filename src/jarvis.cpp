@@ -110,7 +110,7 @@ void Jarvis::listen() {
 
     listen(audio);
 
-    render_clear();
+    display.clear();
     fprintf(stderr, "Stopped.\n");
 }
 
@@ -125,10 +125,7 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
 
     print_header();
 
-    // Print initial display: bar + status + separator
-    fprintf(stderr, "  warming up\033[K\n");
-    fprintf(stderr, "  \033[2m—\033[0m\033[K\n");
-    render_separator();
+    display.init();
 
     if (on_ready) on_ready();
 
@@ -147,7 +144,7 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
         // Wait for ring buffer to accumulate a full detection window
         if (!warmed_up) {
             if (audio->available() < JARVIS_BUFFER_SAMPLES) {
-                render_bar("warming up", 0.0f, default_thr, 0, true);
+                display.bar("warming up", 0.0f, default_thr, 0, true);
                 continue;
             }
             warmed_up = true;
@@ -169,7 +166,7 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
             if (impl->vad.process(pcm_buffer.data() + i) > 0.5f) { has_speech = true; break; }
         }
         if (!has_speech) {
-            render_bar("silence", 0.0f, default_thr, 0, true);
+            display.bar("silence", 0.0f, default_thr, 0, true);
             continue;
         }
 
@@ -182,8 +179,8 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
 
         int show_kw = det.keyword_index >= 0 ? det.keyword_index : det.best_keyword;
         float show_score = det.keyword_index >= 0 ? det.score : det.best_score;
-        render_bar(impl->keywords[show_kw].name.c_str(), show_score,
-                   impl->keywords[show_kw].threshold, det.elapsed_ms, false);
+        display.bar(impl->keywords[show_kw].name.c_str(), show_score,
+                    impl->keywords[show_kw].threshold, det.elapsed_ms, false);
 
         if (det.keyword_index >= 0) {
             const auto &kw = impl->keywords[det.keyword_index];
@@ -193,7 +190,7 @@ void Jarvis::listen(std::shared_ptr<audio_async> audio) {
             char time_buf[32];
             std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&tt));
 
-            render_status(kw.name.c_str(), det.score, time_buf);
+            display.status(kw.name.c_str(), det.score, time_buf);
 
             if (!impl->ding_wav.empty())
                 play_wav(impl->ding_wav.data(), impl->ding_wav.size(), false);

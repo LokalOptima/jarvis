@@ -33,6 +33,7 @@ endif()
 add_library(jarvis_lib STATIC
     src/jarvis.cpp
     src/detect.cpp
+    src/display.cpp
     src/playback.cpp
     src/config.cpp
     src/recorder.cpp

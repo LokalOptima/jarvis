@@ -81,7 +81,7 @@ static void update_client_count() {
     if (prev == n) return;
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", n);
-    render_header_field(2, "clients", buf);
+    g_jarvis->display.header_field(2, "clients", buf);
 }
 
 static void reap_clients() {
@@ -312,7 +312,7 @@ void jarvis_serve(const Config &config,
             auto tt = std::chrono::system_clock::to_time_t(now);
             char tbuf[32];
             std::strftime(tbuf, sizeof(tbuf), "%H:%M:%S", std::localtime(&tt));
-            render_status(name.c_str(), score, tbuf, audio_sec);
+            j.display.status(name.c_str(), score, tbuf, audio_sec);
 
             if (has_listener) {
                 std::string line = evt.dump() + "\n";
@@ -376,6 +376,6 @@ void jarvis_serve(const Config &config,
         j.listen(audio_src);
     }
 
-    render_clear();
+    j.display.clear();
     fprintf(stderr, "Stopped.\n");
 }

@@ -95,15 +95,6 @@ DetectResult detect_once(
     DetectScratch &scratch,
     int skip_frames = 0);
 
-// Terminal display.
-void render_bar(const char *name, float score, float threshold, int ms, bool silent);
-void render_status(const char *keyword, float score, const char *time_str,
-                   float audio_sec = 0);
-void render_log(const char *msg);      // print a line above the display without clobbering it
-void render_header_field(int lines_above_display, const char *label, const char *value);
-void render_separator();
-void render_clear();  // clean up on exit
-
 // Model/template path helpers.
 std::string cache_dir();  // $HOME/.cache/jarvis
 std::string model_tag(const std::string &model_path);

@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <mutex>
+
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -202,9 +202,6 @@ DetectResult detect_once(
             result.best_keyword = k;
         }
         if (result.keyword_index < 0 && score >= keywords[k].threshold) {
-            char dbg[128];
-            snprintf(dbg, sizeof(dbg), "%s  score=%.2f", keywords[k].name.c_str(), score);
-            render_log(dbg);
             result.keyword_index = k;
             result.score = score;
             result.end_frame = end;
@@ -216,125 +213,6 @@ DetectResult detect_once(
     return result;
 }
 
-// ---- Terminal display ----
-//
-// Layout (after header):
-//   line 1:  bar       (render_bar updates this)
-//   line 2:  status    (render_status updates this)
-//   line 3:  separator (render_separator redraws this)
-//
-// Cursor always rests after line 3. To update, move up and overwrite.
-// All render_* functions lock g_display_mu — safe to call from any thread.
-
-static constexpr int DISPLAY_LINES = 3;  // bar + status + separator
-static std::mutex g_display_mu;
-
-void render_separator() {
-    fprintf(stderr, "\033[2m────────────────────────────────────────────────────\033[0m\033[K\n");
-    fflush(stderr);
-}
-
-void render_clear() {
-    std::lock_guard<std::mutex> lk(g_display_mu);
-    fprintf(stderr, "\033[%dA\r", DISPLAY_LINES);
-    for (int i = 0; i < DISPLAY_LINES; i++)
-        fprintf(stderr, "\033[2K\n");
-    fprintf(stderr, "\033[%dA\r", DISPLAY_LINES);
-    fflush(stderr);
-}
-
-void render_log(const char *msg) {
-    std::lock_guard<std::mutex> lk(g_display_mu);
-    fprintf(stderr, "\033[%dA\r", DISPLAY_LINES);
-    fprintf(stderr, "  \033[2m%s\033[0m\033[K\n", msg);
-    fprintf(stderr, "\033[K\n\033[K\n");
-    render_separator();
-}
-
-void render_header_field(int lines_above_display, const char *label, const char *value) {
-    std::lock_guard<std::mutex> lk(g_display_mu);
-    int up = DISPLAY_LINES + lines_above_display;
-    fprintf(stderr, "\033[%dA\r", up);
-    fprintf(stderr, "%10s: %s\033[K", label, value);
-    fprintf(stderr, "\033[%dB\r", up);
-    fflush(stderr);
-}
-
-void render_status(const char *keyword, float score, const char *time_str,
-                   float audio_sec) {
-    std::lock_guard<std::mutex> lk(g_display_mu);
-    fprintf(stderr, "\033[%dA\r", DISPLAY_LINES - 1);
-    if (audio_sec > 0)
-        fprintf(stderr, "  \033[2m[%s]\033[0m %s  %.2f \033[2m(%.1fs audio)\033[0m\033[K\n",
-                time_str, keyword, score, audio_sec);
-    else
-        fprintf(stderr, "  \033[2m[%s]\033[0m %s  %.2f\033[K\n", time_str, keyword, score);
-    render_separator();
-}
-
-void render_bar(const char *name, float score, float threshold, int ms, bool silent) {
-    std::lock_guard<std::mutex> lk(g_display_mu);
-    static char buf[768];
-    char *p = buf;
-
-    constexpr int NAME_W = 14;
-    constexpr int W = 36;
-    float range = threshold * 2.0f;  // bar covers 0 to 2x threshold
-    float norm_score = score / range;
-    float norm_thr = threshold / range;  // always at midpoint
-    int thr = std::max(0, std::min(W - 1, (int)(norm_thr * W)));
-
-    // Move cursor to bar line
-    p += std::snprintf(p, 32, "\033[%dA\r", DISPLAY_LINES);
-    *p++ = ' '; *p++ = ' ';
-
-    int nlen = (int)strlen(name);
-    int copy = std::min(nlen, NAME_W);
-    memcpy(p, name, copy); p += copy;
-    for (int i = copy; i < NAME_W; i++) *p++ = ' ';
-
-    if (silent) {
-        int filled = std::max(0, std::min(W, (int)(norm_score * W)));
-        memcpy(p, "\033[2m", 4); p += 4;
-        for (int i = 0; i < W; i++) {
-            if      (i < filled) { memcpy(p, "\xe2\x96\x88", 3); p += 3; }
-            else if (i == thr)   { memcpy(p, "\xe2\x94\x82", 3); p += 3; }
-            else                 { memcpy(p, "\xc2\xb7", 2); p += 2; }
-        }
-        memcpy(p, "\033[0m\033[K", 7); p += 7;
-    } else {
-        int filled = std::max(0, std::min(W, (int)(norm_score * W)));
-        static const char *esc[]  = { "\033[32m", "\033[1;31m", "\033[2m", "\033[33m" };
-        static const int esc_len[] = { 5, 7, 4, 5 };
-        int color = -1;
-
-        for (int i = 0; i < W; i++) {
-            int want;
-            if      (i == thr)              want = 3;
-            else if (i < filled && i < thr) want = 0;
-            else if (i < filled)            want = 1;
-            else                            want = 2;
-
-            if (want != color) {
-                memcpy(p, esc[want], esc_len[want]);
-                p += esc_len[want];
-                color = want;
-            }
-
-            if (i == thr)        { memcpy(p, "\xe2\x94\x82", 3); p += 3; }
-            else if (i < filled) { memcpy(p, "\xe2\x96\x88", 3); p += 3; }
-            else                 { memcpy(p, "\xc2\xb7", 2); p += 2; }
-        }
-
-        p += std::snprintf(p, 64, "\033[0m  %4.2f  %3dms\033[K", score, ms);
-    }
-
-    // Move to next line (status line) but don't overwrite it, skip to after separator
-    p += std::snprintf(p, 16, "\n\033[%dB", DISPLAY_LINES - 1);
-
-    fwrite(buf, 1, p - buf, stderr);
-    fflush(stderr);
-}
 
 // ---- Path helpers ----
 
