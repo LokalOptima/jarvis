@@ -2,7 +2,7 @@
  * recorder.cpp - VAD-gated audio recording.
  *
  * Adapted from wip/ops.cpp transcribe step.
- * 200ms slide, 600ms silence cooldown, 30s max.
+ * 200ms slide, 1s silence cooldown, 30s max.
  */
 
 #include "recorder.h"
@@ -14,7 +14,7 @@
 
 RecordResult vad_record(SileroVad &vad, std::shared_ptr<audio_async> audio) {
     constexpr int slide_ms       = JARVIS_SLIDE_MS;   // 200
-    constexpr int cooldown_max   = 600;               // ms of silence to commit
+    constexpr int cooldown_max   = 1000;              // ms of silence to commit
     constexpr int max_record_ms  = 30000;
 
     vad.reset();

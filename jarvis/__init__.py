@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 RATE = 16000
@@ -8,6 +9,10 @@ TEMPLATES_DIR = CACHE_DIR / "templates"
 MAX_TEMPLATE_FRAMES = 100  # ~2 seconds at 50 encoder frames/sec
 ONSET_SKIP = 2             # skip first N encoder frames (Whisper "start of audio" artifact)
 STEP_PENALTY = 0.1         # DTW non-diagonal transition penalty
+
+_xdg_config = os.environ.get("XDG_CONFIG_HOME", "")
+CONFIG_DIR = Path(_xdg_config) / "jarvis" if _xdg_config else Path.home() / ".config" / "jarvis"
+CONFIG_PATH = CONFIG_DIR / "config.toml"
 
 
 def keyword_name(phrase: str) -> str:

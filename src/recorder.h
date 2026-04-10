@@ -1,7 +1,7 @@
 /**
  * recorder.h - VAD-gated audio recording.
  *
- * Records from audio_async until silence timeout (600ms) or max duration (30s).
+ * Records from audio_async until silence timeout (1s) or max duration (30s).
  * Uses its own SileroVad instance (separate from the detection VAD).
  */
 

@@ -23,13 +23,95 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 from jarvis import (
-    CLIPS_DIR, TEMPLATES_DIR, MAX_TEMPLATE_FRAMES, ONSET_SKIP,
+    CLIPS_DIR, CONFIG_PATH, TEMPLATES_DIR, MAX_TEMPLATE_FRAMES, ONSET_SKIP,
     keyword_name, list_keyword_dirs,
 )
 from jarvis.dtw import cmvn, dba
 from jarvis.features import extract_features_batch, model_tag, DEFAULT_MODEL
 
 PORT = 8457
+
+
+# ---- Config management ----
+
+def _read_config() -> dict:
+    """Read config.toml into a dict."""
+    if not CONFIG_PATH.exists():
+        return {}
+    cfg: dict = {}
+    current_kw = None
+    for line in CONFIG_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line == "[[keywords]]":
+            cfg.setdefault("keywords", [])
+            current_kw = {}
+            cfg["keywords"].append(current_kw)
+            continue
+        if "=" in line:
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip()
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            else:
+                try:
+                    val = float(val) if "." in val else int(val)
+                except ValueError:
+                    pass
+            if current_kw is not None:
+                current_kw[key] = val
+            else:
+                cfg[key] = val
+    return cfg
+
+
+def _write_config(cfg: dict):
+    """Write config dict to config.toml."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for k, v in cfg.items():
+        if k == "keywords":
+            continue
+        if isinstance(v, str):
+            lines.append(f'{k} = "{v}"')
+        elif isinstance(v, float):
+            lines.append(f"{k} = {v}")
+        elif isinstance(v, int):
+            lines.append(f"{k} = {v}")
+    for kw in cfg.get("keywords", []):
+        lines.append("")
+        lines.append("[[keywords]]")
+        lines.append(f'name = "{kw["name"]}"')
+        lines.append(f'mode = "{kw.get("mode", "keyword")}"')
+    lines.append("")
+    CONFIG_PATH.write_text("\n".join(lines))
+
+
+def _get_keyword_modes() -> dict[str, str]:
+    """Return {name: mode} from config.toml."""
+    return {kw["name"]: kw.get("mode", "keyword")
+            for kw in _read_config().get("keywords", [])}
+
+
+def _set_keyword_in_config(name: str, mode: str):
+    """Add or update a keyword's mode in config.toml."""
+    cfg = _read_config()
+    keywords = cfg.setdefault("keywords", [])
+    for kw in keywords:
+        if kw["name"] == name:
+            kw["mode"] = mode
+            break
+    else:
+        keywords.append({"name": name, "mode": mode})
+    _write_config(cfg)
+
+
+def _remove_keyword_from_config(name: str):
+    """Remove a keyword from config.toml."""
+    cfg = _read_config()
+    cfg["keywords"] = [kw for kw in cfg.get("keywords", []) if kw["name"] != name]
+    _write_config(cfg)
 
 
 # ---- Template build pipeline ----
@@ -153,7 +235,15 @@ HTML = r"""<!DOCTYPE html>
   .kw-add input::placeholder { color: #555; }
   .kw-add button { background: #0f3460; color: #eee; border: none; padding: 5px 10px;
                    border-radius: 4px; cursor: pointer; font-size: 0.9em; }
-  .kw-add button:hover { background: #1a4a7a; }
+  .kw-add button:hover:not(:disabled) { background: #1a4a7a; }
+  .kw-add button:disabled { opacity: 0.4; cursor: default; }
+
+  /* Mode selector */
+  .kw-mode { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; }
+  .kw-mode label { color: #888; font-size: 0.85em; }
+  .kw-mode select { background: #16213e; color: #eee; border: 1px solid #333;
+                    padding: 4px 8px; border-radius: 4px; font-size: 0.85em;
+                    cursor: pointer; }
 
   /* Recording */
   .record-section { margin: 16px 0; }
@@ -221,8 +311,17 @@ HTML = r"""<!DOCTYPE html>
 <div class="kw-bar" id="kw-bar"></div>
 <div class="kw-add">
   <input type="text" id="kw-input" placeholder="new keyword..." spellcheck="false"
-         onkeydown="if(event.key==='Enter')addKeyword()">
-  <button onclick="addKeyword()">+ Add</button>
+         onkeydown="if(event.key==='Enter')addKeyword()"
+         oninput="$('kw-add-btn').disabled = !this.value.trim()">
+  <button id="kw-add-btn" onclick="addKeyword()" disabled>+ Add</button>
+</div>
+
+<div class="kw-mode" id="kw-mode" style="display:none">
+  <label>Mode:</label>
+  <select id="mode-select" onchange="setMode(this.value)">
+    <option value="keyword">keyword</option>
+    <option value="voice">voice</option>
+  </select>
 </div>
 
 <!-- Record -->
@@ -266,6 +365,7 @@ const $ = id => document.getElementById(id);
 
 // ---- State ----
 let currentKw = null;
+let kwModes = {};
 let micStream = null;
 let rec = null, chunks = [], timer = null;
 let audioBuf = null;      // decoded AudioBuffer (native sample rate)
@@ -629,22 +729,47 @@ function discardClip() {
 // ---- Keyword tabs ----
 
 async function loadKeywords() {
-  const kws = await (await fetch('/api/keywords')).json();
+  const data = await (await fetch('/api/keywords')).json();
   const bar = $('kw-bar');
   bar.innerHTML = '';
-  for (const kw of kws) {
+  kwModes = {};
+  const names = [];
+  for (const item of data) {
+    kwModes[item.name] = item.mode || 'keyword';
+    names.push(item.name);
     const tab = document.createElement('span');
-    tab.className = 'kw-tab' + (kw === currentKw ? ' active' : '');
-    tab.innerHTML = kw + '<span class="x" title="Delete keyword">&times;</span>';
+    tab.className = 'kw-tab' + (item.name === currentKw ? ' active' : '');
+    tab.innerHTML = item.name + '<span class="x" title="Delete keyword">&times;</span>';
     tab.addEventListener('click', (e) => {
-      if (e.target.classList.contains('x')) { deleteKeyword(kw); return; }
-      selectKw(kw);
+      if (e.target.classList.contains('x')) { deleteKeyword(item.name); return; }
+      selectKw(item.name);
     });
     bar.appendChild(tab);
   }
-  if (!currentKw && kws.length) selectKw(kws[0]);
-  if (currentKw && !kws.includes(currentKw)) { currentKw = kws[0] || null; }
+  if (!currentKw && names.length) selectKw(names[0]);
+  if (currentKw && !names.includes(currentKw)) { currentKw = names[0] || null; }
+  updateModeSelector();
   updateRecLabel();
+}
+
+function updateModeSelector() {
+  const el = $('kw-mode');
+  if (currentKw && kwModes[currentKw] !== undefined) {
+    el.style.display = 'flex';
+    $('mode-select').value = kwModes[currentKw];
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+async function setMode(mode) {
+  if (!currentKw) return;
+  kwModes[currentKw] = mode;
+  await fetch('/api/set-mode', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: currentKw, mode}),
+  });
 }
 
 function selectKw(kw) {
@@ -664,6 +789,7 @@ async function addKeyword() {
   const d = await r.json();
   if (d.error) { st($('st'), d.error, 'err'); return; }
   input.value = '';
+  $('kw-add-btn').disabled = true;
   currentKw = d.keyword;
   await loadKeywords();
   loadClips();
@@ -809,6 +935,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._add_keyword()
         elif p == "/api/delete-keyword":
             self._delete_keyword()
+        elif p == "/api/set-mode":
+            self._set_mode()
         else:
             self.send_error(404)
 
@@ -859,11 +987,12 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _keywords(self):
         # Include empty dirs (newly added keywords with no clips yet)
+        modes = _get_keyword_modes()
         if CLIPS_DIR.exists():
             kws = sorted(d.name for d in CLIPS_DIR.iterdir() if d.is_dir())
         else:
             kws = []
-        self._json(kws)
+        self._json([{"name": kw, "mode": modes.get(kw, "keyword")} for kw in kws])
 
     def _clips(self, parsed):
         qs = parse_qs(parsed.query)
@@ -962,6 +1091,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._json({"error": "Invalid name"})
             return
         kw_dir.mkdir(parents=True, exist_ok=True)
+        _set_keyword_in_config(kw, "keyword")
         self._json({"ok": True, "keyword": kw})
 
     def _delete_keyword(self):
@@ -975,10 +1105,23 @@ class Handler(SimpleHTTPRequestHandler):
             self._json({"error": "Not found"})
             return
         shutil.rmtree(kw_dir)
-        # Also remove template if it exists
-        tmpl = TEMPLATES_DIR / f"{name}.bin"
-        if tmpl.exists():
+        # Remove all template files for this keyword
+        for tmpl in TEMPLATES_DIR.glob(f"{name}.*.bin"):
             tmpl.unlink()
+        legacy = TEMPLATES_DIR / f"{name}.bin"
+        if legacy.exists():
+            legacy.unlink()
+        _remove_keyword_from_config(name)
+        self._json({"ok": True})
+
+    def _set_mode(self):
+        data = self._read_json_body()
+        name = data.get("name", "").strip()
+        mode = data.get("mode", "").strip()
+        if not name or mode not in ("keyword", "voice"):
+            self._json({"error": "Invalid name or mode"})
+            return
+        _set_keyword_in_config(name, mode)
         self._json({"ok": True})
 
     def _build(self):
@@ -986,6 +1129,14 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             with redirect_stdout(buf):
                 build_templates()
+            # Ensure all built keywords are registered in config (single read+write)
+            cfg = _read_config()
+            keywords = cfg.setdefault("keywords", [])
+            known = {kw["name"] for kw in keywords}
+            for d in list_keyword_dirs():
+                if d.name not in known:
+                    keywords.append({"name": d.name, "mode": "keyword"})
+            _write_config(cfg)
             self._json({"ok": True, "output": buf.getvalue()})
         except SystemExit:
             self._json({"ok": False, "error": buf.getvalue()})
